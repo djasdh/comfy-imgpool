@@ -156,6 +156,56 @@ Rule of thumb:
 - `spawn_failed` / `timeout` / `bad_json` in `pool.log` with an almost-empty CLI log → pool-layer problem
 - `finish exit_code=2|6` plus `{"ok":false,"error":...}` in the CLI log → `imggen` or argument problem
 
+## Remote access and auth
+
+By default `imgpool` listens on `127.0.0.1` with no auth. To let another machine
+drive it (for example an agent on a different host):
+
+```bash
+export IMGPOOL_BIND=10.0.0.5          # bind one interface
+export IMGPOOL_TOKEN=$(openssl rand -hex 24)
+imgpool serve --port 8199 --idle-stop-seconds 900
+printf '%s\n' "$IMGPOOL_TOKEN" > ~/.config/comfy-imgpool.token
+chmod 600 ~/.config/comfy-imgpool.token
+```
+
+- When `IMGPOOL_TOKEN` is set, every request must send `X-Imgpool-Token`
+  (or `?token=`). Requests without it get `401`.
+- `IMGPOOL_BIND` may be a specific interface; the server also keeps a
+  `127.0.0.1` listener so local clients work without extra env.
+- Local clients read the token from `~/.config/comfy-imgpool.token` when
+  `IMGPOOL_TOKEN` is not exported.
+- Download a generated image with `GET /image?id=<job_id>&index=0`
+  (token required). Job JSON also exposes `image_urls`.
+- There is still no per-user authorization; treat the token as a shared secret
+  and keep the port on a private network.
+
+## Hermes agent plugin
+
+`examples/hermes-plugin/imgpool/` is a ready-made Hermes image-generation
+provider that drives this pool over HTTP. Install it as a user plugin:
+
+```bash
+cp -r examples/hermes-plugin/imgpool ~/.hermes/plugins/image_gen/
+hermes plugins enable imgpool
+```
+
+Then point `~/.hermes/config.yaml` at the pool:
+
+```yaml
+image_gen:
+  provider: imgpool
+  model: imgpool-moss
+  imgpool:
+    base_url: http://10.0.0.5:8199
+    token: <IMGPOOL_TOKEN>
+    timeout: 600
+    poll_interval: 2
+```
+
+Model ids map to `imggen` presets: `imgpool-moss`, `imgpool-anima-fast`,
+`imgpool-anima-1536`, `imgpool-krea2-720p`, `imgpool-krea2-2k`.
+
 ## Idle shutdown
 
 `imgpool` stops ComfyUI after **900 seconds** (15 min) with no generation requests:
@@ -195,6 +245,11 @@ loginctl enable-linger "$USER"     # start without an active login session
 | `COMFY_LOG` | `$COMFY_ROOT/logs/comfy-2k.log` | `imggen` |
 | `IMGGEN_BIN` | `imggen` next to `imgpool` | `imgpool` |
 | `IMGPOOL_PORT` | `8199` | `imgpool` |
+| `IMGPOOL_BIND` | `127.0.0.1` | `imgpool` server bind address |
+| `IMGPOOL_TOKEN` | unset | `imgpool` shared token (enables auth) |
+| `IMGPOOL_TOKEN_FILE` | `~/.config/comfy-imgpool.token` | `imgpool` client token fallback |
+| `IMGPOOL_URL` | derived from bind/port | `imgpool` client base URL |
+| `COMFY_DIR` | `$COMFY_ROOT/ComfyUI` | `/image` path validation |
 | `IMGPOOL_CONCURRENCY` | `1` | `imgpool` |
 | `IMGPOOL_IDLE_STOP_SECONDS` | `900` | `imgpool` |
 | `IMGPOOL_LOG_DIR` | `$COMFY_ROOT/logs/imgpool` | `imgpool` |

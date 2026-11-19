@@ -1,0 +1,5 @@
+name: imgpool
+version: 1.0.0
+description: "Local comfy-imgpool CLI over HTTP (imggen + queue): presets for MOSS / Anima / Krea2, job ids, prev/next context. Text-to-image only."
+author: local
+kind: backend
