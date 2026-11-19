@@ -1,0 +1,1380 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""imgpool — 并行化的出图任务池（给多个 agent/LLM 同时调用 imggen）。
+
+为什么需要它：
+  - 一张 16GB 卡同一时刻只能跑一个模型，但多个调用方可以并发提交。
+  - 每个调用方需要知道「我这张之前/之后是谁、用的什么模型、来自哪个调用方」，
+    以便判断上下文（例如换模型后的首张会明显变慢）。
+  - 出问题时要能区分是任务池的锅还是 imggen CLI 的锅，所以两层日志分开写：
+        logs/imgpool/pool.log        任务池事件（提交/出队/启动/退出码/异常）
+        logs/imgpool/cli/<id>.log    该任务 imggen 的原始 stdout+stderr
+        logs/imgpool/jobs.jsonl      结构化任务记录（追加写，重启后仍可查）
+
+常用命令：
+  imgpool start                                  # 启动后台服务
+  imgpool submit -m moss "一只猫" --source a1     # 提交并等待（默认 --wait）
+  imgpool submit -m anima --size 1344x768 "x" --no-wait
+  imgpool status                                 # 当前排队
+  imgpool status --id job_xxx                    # 按 id 查（含上一张/下一张）
+  imgpool result --id job_xxx
+  imgpool wait --id job_xxx
+  imgpool list --limit 10
+  imgpool logs --id job_xxx --tail 50            # imggen 原始日志
+  imgpool logs --pool --tail 50                  # 任务池日志
+  imgpool cancel --id job_xxx
+  imgpool stop
+
+输出：stdout 只有一行 JSON；人看的进度写 stderr。
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import queue
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+def _find_comfy_root():
+    """定位 ComfyUI 项目根目录：COMFY_ROOT > 向上查找含 ComfyUI/ 的目录。"""
+    env = os.environ.get("COMFY_ROOT")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    here = os.path.dirname(os.path.realpath(__file__))
+    for base in (os.getcwd(), here):
+        d = base
+        for _ in range(5):
+            if os.path.isdir(os.path.join(d, "ComfyUI")):
+                return d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+    return os.path.dirname(here)
+
+ROOT = _find_comfy_root()
+IMGGEN = os.environ.get("IMGGEN_BIN", os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "imggen"))
+STATE_DIR = os.environ.get("IMGPOOL_STATE_DIR", "/tmp/comfy-imgpool")
+os.makedirs(STATE_DIR, exist_ok=True)
+LOG_DIR = os.environ.get("IMGPOOL_LOG_DIR", os.path.join(ROOT, "logs", "imgpool"))
+CLI_LOG_DIR = os.path.join(LOG_DIR, "cli")
+POOL_LOG = os.path.join(LOG_DIR, "pool.log")
+JOBS_JSONL = os.path.join(LOG_DIR, "jobs.jsonl")
+PORT = int(os.environ.get("IMGPOOL_PORT", "8199"))
+PID_FILE = os.path.join(STATE_DIR, f"imgpool-{PORT}.pid")
+BASE = f"http://127.0.0.1:{PORT}"
+
+COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+ACTIVITY_FILE = os.environ.get("IMGPOOL_ACTIVITY_FILE",
+                               os.path.join(STATE_DIR, "comfy-last-activity"))
+IDLE_STOP_SECONDS = int(os.environ.get("IMGPOOL_IDLE_STOP_SECONDS", "900"))
+COMFY_UNIT = os.environ.get("COMFY_UNIT", "comfyui")
+
+DEFAULT_CONCURRENCY = int(os.environ.get("IMGPOOL_CONCURRENCY", "1"))
+DEFAULT_TIMEOUT = 1200
+
+
+def now_iso():
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="milliseconds")
+
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+_log_lock = threading.Lock()
+
+
+def _ensure_dirs():
+    os.makedirs(CLI_LOG_DIR, exist_ok=True)
+
+
+def plog(level, msg, **kw):
+    """任务池层日志。每行带时间和 key=value，便于 grep。"""
+    _ensure_dirs()
+    parts = [now_iso(), level, msg]
+    for k, v in kw.items():
+        if v is None:
+            continue
+        s = str(v).replace("\n", "\\n")
+        if any(c.isspace() for c in s) or "=" in s:
+            s = json.dumps(s, ensure_ascii=False)
+        parts.append(f"{k}={s}")
+    line = " ".join(parts)
+    if not os.environ.get("IMGPOOL_QUIET"):
+        print(line, file=sys.stderr, flush=True)
+    with _log_lock:
+        try:
+            if os.path.getsize(POOL_LOG) > 20 * 1024 * 1024:
+                os.replace(POOL_LOG, POOL_LOG + ".1")
+        except Exception:
+            pass
+        with open(POOL_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+
+def append_jobs_jsonl(rec):
+    _ensure_dirs()
+    with _log_lock:
+        try:
+            if os.path.getsize(JOBS_JSONL) > 50 * 1024 * 1024:
+                os.replace(JOBS_JSONL, JOBS_JSONL + ".1")
+        except Exception:
+            pass
+        with open(JOBS_JSONL, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# 任务池核心
+# ---------------------------------------------------------------------------
+class Job(dict):
+    pass
+
+
+class Pool:
+    def __init__(self, concurrency=DEFAULT_CONCURRENCY):
+        self.cv = threading.Condition(threading.RLock())
+        self.jobs = {}          # id -> Job
+        self.order = []         # ids, 按 seq 升序
+        self.seq = 0
+        self.running = 0
+        self.concurrency = max(1, int(concurrency))
+        self.stopping = False
+        self.last_activity = time.time()
+        self.stop_lock = threading.Lock()
+
+    # ---- 视图 -------------------------------------------------------------
+    def _position(self, job):
+        with self.cv:
+            return self._position_locked(job)
+
+    def _position_locked(self, job):
+        if job["state"] != "queued":
+            return None
+        pos = 1
+        for jid in self.order:
+            j = self.jobs.get(jid)
+            if j and j["seq"] < job["seq"] and j["state"] == "queued":
+                pos += 1
+        return pos
+
+    def view(self, job, full=False):
+        with self.cv:
+            return self._view_locked(job, full)
+
+    def _view_locked(self, job, full=False):
+        d = {
+            "id": job["id"],
+            "seq": job["seq"],
+            "model": job["model"],
+            "source": job["source"],
+            "state": job["state"],
+            "submitted_at": job["submitted_at"],
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "seconds": job.get("seconds"),
+            "exit_code": job.get("exit_code"),
+            "position": self._position_locked(job),
+            "cancel_requested": bool(job.get("cancel_requested")),
+        }
+        if full:
+            d["args"] = job["args"]
+            d["prompt"] = job.get("prompt", "")
+            d["result"] = job.get("result")
+            d["error"] = job.get("error")
+            d["error_layer"] = job.get("error_layer")
+            d["cli_log"] = job.get("cli_log")
+        else:
+            d["prompt_head"] = (job.get("prompt") or "")[:80]
+        return d
+
+    def neighbors(self, job):
+        with self.cv:
+            return self._neighbors_locked(job)
+
+    def _neighbors_locked(self, job):
+        """上一张/下一张（按提交顺序，不限状态）。"""
+        prev = next_ = None
+        for jid in self.order:
+            j = self.jobs.get(jid)
+            if not j:
+                continue
+            if j["seq"] < job["seq"]:
+                prev = j
+            elif j["seq"] > job["seq"]:
+                next_ = j
+                break
+        def brief(j):
+            if not j:
+                return None
+            d = {"id": j["id"], "seq": j["seq"], "model": j["model"],
+                 "source": j["source"], "state": j["state"]}
+            if j.get("result", {}) and j["result"].get("images"):
+                d["image"] = j["result"]["images"][0]
+            return d
+        return brief(prev), brief(next_)
+
+    def queue_snapshot(self):
+        with self.cv:
+            return self._queue_snapshot_locked()
+
+    def _queue_snapshot_locked(self):
+        running, pending = [], []
+        for jid in self.order:
+            j = self.jobs.get(jid)
+            if not j:
+                continue
+            if j["state"] == "running":
+                running.append(self._view_locked(j))
+            elif j["state"] == "queued":
+                pending.append(self._view_locked(j))
+        counts = {"queued": 0, "running": 0, "done": 0, "failed": 0,
+                  "cancelled": 0, "interrupted": 0}
+        for j in self.jobs.values():
+            counts[j["state"]] = counts.get(j["state"], 0) + 1
+        return {"running": running, "pending": pending, "counts": counts,
+                "concurrency": self.concurrency}
+
+    # ---- 生命周期 ---------------------------------------------------------
+    def submit(self, spec):
+        # 与空闲停机互斥：要么在停机判定前登记活动，要么等停机结束后再提交，
+        # 由 imggen 的 ensure_service 重新拉起 ComfyUI，避免任务被杀。
+        with self.stop_lock, self.cv:
+            if self.stopping:
+                raise RuntimeError("pool is stopping")
+            self.seq += 1
+            jid = (f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+                   f"{uuid.uuid4().hex[:6]}")
+            job = Job(
+                id=jid, seq=self.seq,
+                model=spec.get("model") or "moss",
+                source=spec.get("source") or "cli",
+                prompt=spec.get("prompt", ""),
+                args=list(spec.get("args") or []),
+                timeout=int(spec.get("timeout") or DEFAULT_TIMEOUT),
+                state="queued",
+                submitted_at=now_iso(),
+            )
+            self.jobs[jid] = job
+            self.order.append(jid)
+            self._trim_locked()
+            self.last_activity = time.time()
+            _touch_activity()
+            plog("INFO", "submit", id=jid, seq=job["seq"], model=job["model"],
+                 source=job["source"], prompt_len=len(job["prompt"] or ""))
+            append_jobs_jsonl({"event": "submit", "at": job["submitted_at"],
+                               "job": self.view(job, full=True)})
+            self.cv.notify_all()
+            return self.view(job, full=True)
+
+    def cancel(self, jid):
+        interrupt = False
+        with self.cv:
+            job = self.jobs.get(jid)
+            if not job:
+                return None
+            if job["state"] in ("done", "failed", "cancelled", "interrupted"):
+                return self.view(job, full=True)
+            if job["state"] == "queued":
+                job["state"] = "cancelled"
+                job["finished_at"] = now_iso()
+                plog("INFO", "cancel", id=jid, state="queued")
+            elif job["state"] == "running":
+                job["cancel_requested"] = True
+                p = job.get("_proc")
+                if p and p.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+                    except Exception as e:
+                        plog("WARN", "kill_failed", id=jid, err=e)
+                plog("INFO", "cancel", id=jid, state="running")
+                interrupt = True
+            self.cv.notify_all()
+            view = self.view(job, full=True)
+        if interrupt:
+            # imggen 被 SIGTERM 时不会自己发 /interrupt，这里兜底停掉采样
+            _interrupt_comfy()
+        return view
+
+    def _start_thread(self, job):
+        t = threading.Thread(target=self._run_job, args=(job,), daemon=True,
+                             name=job["id"])
+        t.start()
+
+    def _run_job(self, job):
+        jid = job["id"]
+        with self.cv:
+            if job.get("_started"):
+                plog("ERROR", "duplicate_start_blocked", id=jid)
+                return
+            job["_started"] = True
+            if job.get("cancel_requested") or job.get("stop_requested"):
+                self.running -= 1
+                job["state"] = ("interrupted" if job.get("stop_requested")
+                                else "cancelled")
+                job["finished_at"] = now_iso()
+                plog("INFO", "cancel_before_start", id=jid, state=job["state"])
+                self.cv.notify_all()
+                return
+        _ensure_dirs()
+        cli_log = os.path.join(CLI_LOG_DIR, f"{jid}.log")
+        job["cli_log"] = cli_log
+        argv = [IMGGEN] + job["args"]
+        plog("INFO", "start", id=jid, model=job["model"], source=job["source"],
+             argv=json.dumps(argv[1:], ensure_ascii=False))
+        t0 = time.time()
+        exit_code = None
+        lines = []
+        try:
+            lf = open(cli_log, "w", encoding="utf-8")
+            lf.write(f"# {now_iso()} argv={json.dumps(argv, ensure_ascii=False)}\n")
+            lf.flush()
+            # stderr 合并进 stdout，并且逐行落盘：任务运行中也能 logs --id 观察
+            p = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, text=True,
+                                 bufsize=1, start_new_session=True)
+            with self.cv:
+                job["_proc"] = p
+
+            def pump():
+                try:
+                    for line in p.stdout:
+                        lines.append(line)
+                        if len(lines) > 5000:   # 防止超长输出吃内存
+                            del lines[:1000]
+                        lf.write(line)
+                        lf.flush()
+                except Exception:
+                    pass
+
+            th = threading.Thread(target=pump, daemon=True)
+            th.start()
+            try:
+                p.wait(timeout=job["timeout"])
+            except subprocess.TimeoutExpired:
+                plog("WARN", "timeout", id=jid, timeout=job["timeout"])
+                try:
+                    os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                p.wait()
+                exit_code = "timeout"
+            th.join(timeout=5)
+            lf.close()
+            if exit_code is None:
+                exit_code = p.returncode
+        except Exception as e:
+            job["error"] = f"pool_spawn_failed: {type(e).__name__}: {e}"
+            job["error_layer"] = "pool"
+            plog("ERROR", "spawn_failed", id=jid, err=job["error"])
+            exit_code = exit_code if exit_code is not None else "spawn_error"
+
+        out_text = "".join(lines)
+        seconds = round(time.time() - t0, 1)
+        result = None
+        # imggen 失败时也会在 stdout 输出 {"ok":false,"error":...}，
+        # 所以不看退出码、先解析，避免被 stderr 的进度行掩盖真实原因。
+        for line in reversed(out_text.strip().splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    result = json.loads(line)
+                    break
+                except Exception:
+                    continue
+
+        cli_error = (result or {}).get("error")
+        cli_message = (result or {}).get("message")
+        if result is not None:
+            if cli_error:
+                job["error"] = (f"{cli_error}: {cli_message}" if cli_message
+                                else cli_error)
+                job["error_layer"] = "imggen"
+            elif not result.get("ok", False):
+                job["error"] = f"imggen_reported_failure: {cli_message or 'no message'}"
+                job["error_layer"] = "imggen"
+        elif exit_code == 0:
+            job["error"] = "bad_cli_output: imggen 退出 0 但没有可解析的 JSON"
+            job["error_layer"] = "imggen"
+            exit_code = "bad_json"
+        elif not job.get("error"):
+            tail = [ln for ln in out_text.strip().splitlines() if ln.strip()]
+            job["error"] = f"cli_exit_{exit_code}: " + (tail[-1][:300] if tail else "")
+            job["error_layer"] = "pool"
+
+        with self.cv:
+            self.last_activity = time.time()
+            _touch_activity()
+            self.running -= 1
+            job.pop("_proc", None)
+            job["exit_code"] = exit_code
+            job["seconds"] = seconds
+            job["finished_at"] = now_iso()
+            job["result"] = result
+            if job.get("stop_requested"):
+                job["state"] = "interrupted"
+                job["error"] = None
+                job.pop("error_layer", None)
+            elif job.get("cancel_requested"):
+                job["state"] = "cancelled"
+                job["error"] = None
+                job.pop("error_layer", None)
+            elif (exit_code == 0 and result and result.get("ok")
+                  and (result.get("images") or result.get("dry"))):
+                job["state"] = "done"
+            elif exit_code == 0 and result and result.get("ok"):
+                job["error"] = "no_images: imggen 报告成功但没有图片"
+                job["error_layer"] = "imggen"
+                job["state"] = "failed"
+            else:
+                job["state"] = "failed"
+            prev, next_ = self.neighbors(job)
+            plog("INFO", "finish", id=jid, state=job["state"],
+                 exit_code=exit_code, seconds=seconds,
+                 images=len((result or {}).get("images") or []),
+                 error=job.get("error"))
+            append_jobs_jsonl({"event": "finish", "at": job["finished_at"],
+                               "job": self.view(job, full=True),
+                               "prev": prev, "next": next_})
+            self.cv.notify_all()
+
+    def _trim_locked(self, keep=500):
+        terminal = ("done", "failed", "cancelled", "interrupted")
+        excess = len(self.order) - keep
+        if excess <= 0:
+            return
+        drop = []
+        for jid in self.order:
+            if excess <= 0:
+                break
+            j = self.jobs.get(jid)
+            if j and j["state"] in terminal:
+                drop.append(jid)
+                excess -= 1
+        for jid in drop:
+            self.order.remove(jid)
+            self.jobs.pop(jid, None)
+
+    def begin_stop(self, force=False):
+        with self.cv:
+            running = [j for j in self.jobs.values() if j["state"] == "running"]
+            queued = [j for j in self.jobs.values() if j["state"] == "queued"]
+            if running and not force:
+                return {"ok": False, "error": "busy",
+                        "running": [self._view_locked(j) for j in running],
+                        "hint": "有任务正在跑；imgpool stop --force 会中断它们"}
+            for j in queued:
+                j["state"] = "interrupted"
+                j["finished_at"] = now_iso()
+            for j in running:
+                j["stop_requested"] = True
+                pr = j.get("_proc")
+                if pr and pr.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(pr.pid), signal.SIGTERM)
+                    except Exception:
+                        pass
+            self.stopping = True
+            self.cv.notify_all()
+        # 兜底：中断 ComfyUI 里正在跑的那次采样（imggen 被 SIGTERM 时不会自己发）
+        if running:
+            _interrupt_comfy()
+        return {"ok": True, "stopping": True, "forced": bool(force),
+                "interrupted": len(running) + len(queued)}
+
+    def load_history(self, path, max_jobs=200):
+        """启动时从 jobs.jsonl 恢复最近任务，保证重启后 list/status 仍可查。"""
+        if not os.path.exists(path):
+            return 0
+        latest = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    j = rec.get("job") or {}
+                    jid = j.get("id")
+                    if jid:
+                        latest[jid] = j
+        except Exception:
+            return 0
+        terminal = ("done", "failed", "cancelled", "interrupted")
+        items = [j for j in latest.values() if j.get("state") in terminal]
+        items.sort(key=lambda j: j.get("seq") or 0)
+        items = items[-max_jobs:]
+        with self.cv:
+            for j in items:
+                jid = j["id"]
+                if jid in self.jobs:
+                    continue
+                job = Job(id=jid, seq=j.get("seq") or 0,
+                          model=j.get("model") or "?",
+                          source=j.get("source") or "?",
+                          prompt=j.get("prompt", ""),
+                          args=j.get("args") or [],
+                          timeout=DEFAULT_TIMEOUT,
+                          state=j.get("state"),
+                          submitted_at=j.get("submitted_at") or now_iso(),
+                          started_at=j.get("started_at"),
+                          finished_at=j.get("finished_at"),
+                          seconds=j.get("seconds"),
+                          exit_code=j.get("exit_code"),
+                          result=j.get("result"),
+                          error=j.get("error"),
+                          cli_log=j.get("cli_log"))
+                job["_history"] = True
+                self.jobs[jid] = job
+                self.order.append(jid)
+                self.seq = max(self.seq, job["seq"])
+            self.order.sort(key=lambda x: self.jobs[x]["seq"])
+        return len(items)
+
+    def dispatcher(self):
+        plog("INFO", "dispatcher_start", concurrency=self.concurrency)
+        while True:
+            job = None
+            with self.cv:
+                while not self.stopping:
+                    if self.running < self.concurrency:
+                        for jid in self.order:
+                            j = self.jobs.get(jid)
+                            if j and j["state"] == "queued":
+                                # 必须在锁内改状态：否则调度器会再次选中同一个
+                                # queued 任务，导致 imggen 被启动两次。
+                                j["state"] = "running"
+                                j["started_at"] = now_iso()
+                                self.running += 1
+                                job = j
+                                break
+                    if job is not None:
+                        break
+                    self.cv.wait(timeout=0.5)
+                if self.stopping:
+                    return
+            self._start_thread(job)
+
+
+# ---------------------------------------------------------------------------
+# HTTP 服务
+# ---------------------------------------------------------------------------
+POOL = None
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # 静音默认访问日志
+        return
+
+    def _send(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        return json.loads(self.rfile.read(n).decode() or "{}")
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        try:
+            if u.path == "/health":
+                return self._send(200, {
+                    "ok": True, "pid": os.getpid(),
+                    "concurrency": POOL.concurrency,
+                    "queue": POOL.queue_snapshot()})
+            if u.path == "/queue":
+                return self._send(200, {"ok": True, "queue": POOL.queue_snapshot()})
+            if u.path == "/job":
+                jid = (q.get("id") or [""])[0]
+                job = POOL.jobs.get(jid)
+                if not job:
+                    return self._send(404, {"ok": False, "error": "not_found", "id": jid})
+                prev, next_ = POOL.neighbors(job)
+                return self._send(200, {"ok": True, "job": POOL.view(job, full=True),
+                                        "prev": prev, "next": next_,
+                                        "queue": POOL.queue_snapshot()})
+            if u.path == "/log":
+                jid = (q.get("id") or [""])[0]
+                tail = int((q.get("tail") or ["200"])[0])
+                job = POOL.jobs.get(jid)
+                if not job or not job.get("cli_log"):
+                    return self._send(404, {"ok": False, "error": "not_found", "id": jid})
+                return self._send(200, {"ok": True, "id": jid,
+                                        "cli_log": job["cli_log"],
+                                        "tail": _tail(job["cli_log"], tail)})
+            if u.path == "/jobs":
+                limit = max(1, min(int((q.get("limit") or ["50"])[0]), 1000))
+                items = [POOL.view(POOL.jobs[j], full=False)
+                         for j in POOL.order[-limit:]]
+                return self._send(200, {"ok": True, "jobs": items})
+            return self._send(404, {"ok": False, "error": "unknown_path"})
+        except Exception as e:
+            return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def do_POST(self):
+        u = urllib.parse.urlparse(self.path)
+        try:
+            if u.path == "/submit":
+                body = self._body()
+                job = POOL.submit(body)
+                prev, next_ = POOL.neighbors(POOL.jobs[job["id"]])
+                return self._send(200, {"ok": True, "job": job,
+                                        "prev": prev, "next": next_,
+                                        "queue": POOL.queue_snapshot()})
+            if u.path == "/cancel":
+                body = self._body()
+                jid = body.get("id", "")
+                src = body.get("source")
+                j = POOL.jobs.get(jid)
+                if j and src and j["source"] != src and not body.get("force"):
+                    return self._send(403, {
+                        "ok": False, "error": "not_owner",
+                        "message": f"任务属于 source={j['source']}",
+                        "hint": "确认要取消他人的任务时加 --force"})
+                job = POOL.cancel(jid)
+                if not job:
+                    return self._send(404, {"ok": False, "error": "not_found"})
+                prev, next_ = POOL.neighbors(POOL.jobs[jid])
+                return self._send(200, {"ok": True, "job": job,
+                                        "prev": prev, "next": next_,
+                                        "queue": POOL.queue_snapshot()})
+            if u.path == "/stop":
+                body = self._body()
+                res = POOL.begin_stop(force=bool(body.get("force")))
+                if not res.get("ok"):
+                    return self._send(409, res)
+                threading.Thread(target=lambda: (time.sleep(0.2),
+                                                 self.server.shutdown()),
+                                 daemon=True).start()
+                return self._send(200, res)
+            return self._send(404, {"ok": False, "error": "unknown_path"})
+        except Exception as e:
+            return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+
+def _touch_activity():
+    try:
+        os.makedirs(os.path.dirname(ACTIVITY_FILE), exist_ok=True)
+        with open(ACTIVITY_FILE, "a"):
+            os.utime(ACTIVITY_FILE, None)
+    except Exception:
+        pass
+
+
+def _activity_ts():
+    try:
+        return os.path.getmtime(ACTIVITY_FILE)
+    except Exception:
+        return 0.0
+
+
+def _comfy_queue_busy():
+    """True=有任务，False=空闲，None=不可达，("error", code)=可达但异常。"""
+    try:
+        with urllib.request.urlopen(COMFY_URL + "/queue", timeout=3) as r:
+            q = json.loads(r.read())
+        return bool(q.get("queue_running") or q.get("queue_pending"))
+    except urllib.error.HTTPError as e:
+        return ("error", e.code)
+    except Exception:
+        return None
+
+
+def _stop_comfy():
+    """返回 (ok, rc, 错误摘要)。"""
+    try:
+        r = subprocess.run(["systemctl", "--user", "stop", COMFY_UNIT],
+                           capture_output=True, text=True, timeout=15)
+        msg = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:300]
+        return (r.returncode == 0, r.returncode, msg)
+    except Exception as e:
+        return (False, "error", f"{type(e).__name__}: {e}")
+
+
+def _interrupt_comfy():
+    try:
+        req = urllib.request.Request(
+            COMFY_URL + "/interrupt", data=b"{}",
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
+def _file_md5(path):
+    try:
+        return hashlib.md5(open(path, "rb").read()).hexdigest()[:8]
+    except Exception:
+        return "?"
+
+
+def _tail(path, n):
+    n = 200 if n is None else int(n)
+    n = max(1, min(n, 5000))
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-n:])
+    except Exception as e:
+        return f"<读不到日志: {e}>"
+
+
+def idle_watch(seconds):
+    if seconds <= 0:
+        plog("INFO", "idle_watch_disabled")
+        return
+    plog("INFO", "idle_watch_start", seconds=seconds, unit=COMFY_UNIT,
+         comfy=COMFY_URL)
+    probe_error = None
+    was_up = None
+    tick = 0
+    while not POOL.stopping:
+        time.sleep(15)
+        tick += 1
+        with POOL.cv:
+            busy = any(j["state"] in ("queued", "running")
+                       for j in POOL.jobs.values())
+            last = POOL.last_activity
+        if busy:
+            continue
+
+        cq = _comfy_queue_busy()
+        if isinstance(cq, tuple):          # ComfyUI 可达但 /queue 报错
+            was_up = True
+            if probe_error != cq[1]:
+                plog("WARN", "idle_probe_error", http=cq[1], comfy=COMFY_URL)
+                probe_error = cq[1]
+            continue
+        probe_error = None
+        if cq is None:                      # ComfyUI 没起
+            was_up = False
+            continue
+
+        if not was_up:
+            # down -> up：无论谁拉起的（桌面图标 / 直接 systemctl / 其他工具），
+            # 都从这一刻重新给满 15 分钟，避免刚起来就被池停掉。
+            with POOL.cv:
+                POOL.last_activity = max(POOL.last_activity, time.time())
+            plog("INFO", "idle_epoch_reset", reason="comfy_up", comfy=COMFY_URL)
+        was_up = True
+
+        last = max(last, _activity_ts())
+        idle = time.time() - last
+        if cq or idle < seconds:
+            if tick % 20 == 0:
+                plog("INFO", "idle_state", idle_seconds=round(idle),
+                     queue="busy" if cq else "empty")
+            continue
+
+        with POOL.stop_lock:
+            # 第三次确认：拿锁后重新看提交与心跳
+            with POOL.cv:
+                busy = any(j["state"] in ("queued", "running")
+                           for j in POOL.jobs.values())
+                last = max(POOL.last_activity, _activity_ts())
+            if busy or time.time() - last < seconds:
+                continue
+            if _comfy_queue_busy() is not False:
+                continue
+            idle_now = round(time.time() - last)
+            plog("INFO", "idle_stop_begin", idle_seconds=idle_now, unit=COMFY_UNIT)
+            ok, rc, err = _stop_comfy()
+            if ok:
+                time.sleep(1)
+                left = _comfy_queue_busy()
+                if left is not None:
+                    ok, err = False, "stop rc=0 但 ComfyUI 仍可达"
+            if ok:
+                with POOL.cv:
+                    POOL.last_activity = time.time()
+            # 失败不重置纪元：下一轮（15s 后）继续重试
+            plog("INFO" if ok else "WARN", "idle_stop", idle_seconds=idle_now,
+                 ok=ok, rc=rc, err=err[:200])
+
+
+def _cleanup_cli_logs(days=7, keep=500):
+    try:
+        files = [os.path.join(CLI_LOG_DIR, f) for f in os.listdir(CLI_LOG_DIR)
+                 if f.endswith(".log")]
+        cutoff = time.time() - days * 86400
+        files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+        for i, f in enumerate(files):
+            try:
+                if i >= keep or os.path.getmtime(f) < cutoff:
+                    os.unlink(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def serve(port, concurrency, idle_seconds=None):
+    global POOL, IDLE_STOP_SECONDS
+    if idle_seconds is not None:
+        IDLE_STOP_SECONDS = idle_seconds
+    _ensure_dirs()
+    POOL = Pool(concurrency)
+    _cleanup_cli_logs()
+    restored = POOL.load_history(JOBS_JSONL)
+    if restored:
+        plog("INFO", "history_loaded", jobs=restored)
+    th = threading.Thread(target=POOL.dispatcher, daemon=True)
+    th.start()
+    threading.Thread(target=idle_watch, args=(IDLE_STOP_SECONDS,),
+                     daemon=True).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+
+    def _graceful(signum, frame):
+        # systemctl stop 会发 SIGTERM：走与 /stop --force 相同的收尾路径，
+        # 把运行中任务标成 interrupted 并中断 ComfyUI，避免状态丢失。
+        def _do():
+            try:
+                POOL.begin_stop(force=True)
+            except Exception:
+                pass
+            srv.shutdown()
+        threading.Thread(target=_do, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _graceful)
+    signal.signal(signal.SIGINT, _graceful)
+    pid_path = os.path.join(STATE_DIR, f"imgpool-{port}.pid")
+    try:
+        os.makedirs(os.path.dirname(pid_path), exist_ok=True)
+        open(pid_path, "w").write(str(os.getpid()))
+    except Exception:
+        pass
+    plog("INFO", "pool_listen", port=port, pid=os.getpid(),
+         concurrency=concurrency, imgpool_md5=_file_md5(__file__),
+         imggen_md5=_file_md5(IMGGEN), idle_seconds=IDLE_STOP_SECONDS,
+         comfy=COMFY_URL)
+    try:
+        srv.serve_forever()
+    finally:
+        try:
+            os.unlink(pid_path)
+        except Exception:
+            pass
+        plog("INFO", "pool_exit")
+
+
+# ---------------------------------------------------------------------------
+# 客户端
+# ---------------------------------------------------------------------------
+def cget(path, timeout=10):
+    with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def cpost(path, obj, timeout=30):
+    req = urllib.request.Request(BASE + path, data=json.dumps(obj).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def alive():
+    try:
+        cget("/health", timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+def _systemd_unit_exists():
+    return os.path.exists(os.path.expanduser("~/.config/systemd/user/imgpool.service"))
+
+
+def ensure_daemon():
+    if alive():
+        return False
+    _ensure_dirs()
+    import fcntl
+    lock_path = os.path.join(STATE_DIR, "imgpool.start.lock")
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)   # 并发客户端只让一个真正启动
+        if alive():
+            return False
+        # 配了 systemd 用户单元就走 systemctl，避免出现「unit inactive 但端口被
+        # 一个无人管理的进程占着」的分裂状态。
+        if _systemd_unit_exists():
+            try:
+                subprocess.run(["systemctl", "--user", "reset-failed",
+                                "imgpool.service"], capture_output=True, timeout=10)
+                r = subprocess.run(["systemctl", "--user", "start",
+                                    "imgpool.service"], capture_output=True,
+                                   timeout=30)
+                if r.returncode == 0:
+                    for _ in range(100):
+                        if alive():
+                            return True
+                        time.sleep(0.2)
+            except Exception:
+                pass
+        logf = open(os.path.join(LOG_DIR, "daemon.out"), "a")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve",
+                          "--port", str(PORT),
+                          "--concurrency", str(DEFAULT_CONCURRENCY)],
+                         stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+        for _ in range(100):
+            if alive():
+                return True
+            time.sleep(0.2)
+    raise SystemExit(json.dumps({"ok": False, "error": "daemon_start_failed",
+                                 "hint": f"看 {LOG_DIR}/daemon.out"}))
+
+
+def emit(obj):
+    try:
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        os._exit(0)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_imggen_args(a, prompt):
+    # 相对路径按调用方 cwd 解析，避免被守护进程的 cwd 影响
+    if a.edit:
+        a.edit = os.path.abspath(a.edit)
+    args = ["--model", a.model]
+    if prompt:
+        args.append(prompt)
+    if a.source:
+        pass  # source 只用于池元数据
+    for name in ("seed", "preset", "size", "width", "height", "steps", "steps2",
+                 "cfg", "denoise", "denoise2", "scale", "out", "edit",
+                 "lora_strength", "edit_strength", "queue_wait", "lock_wait"):
+        v = getattr(a, name, None)
+        if v is None:
+            continue
+        flag = "--" + name.replace("_", "-")
+        args += [flag, str(v)]
+    for name in ("lora",):
+        for v in getattr(a, name, []) or []:
+            args += ["--" + name, v]
+    for name in ("allow_risky", "no_restart"):
+        if getattr(a, name, False):
+            args.append("--" + name.replace("_", "-"))
+    if a.prompt_file:
+        args += ["--prompt-file", os.path.abspath(a.prompt_file)]
+    return args
+
+
+def cmd_submit(a):
+    import re as _re
+    if a.model not in ("moss", "anima", "krea2"):
+        emit({"ok": False, "error": "bad_model",
+              "message": f"未知模型 {a.model!r}", "hint": "moss / anima / krea2"})
+        return 2
+    if a.job_timeout is not None and int(a.job_timeout) <= 0:
+        emit({"ok": False, "error": "bad_timeout",
+              "message": "--timeout 必须大于 0"})
+        return 2
+    if a.size:
+        m = _re.fullmatch(r"(\d+)[xX\u00d7](\d+)", a.size.strip())
+        if not m:
+            emit({"ok": False, "error": "bad_size",
+                  "message": f"--size 需要 WxH 格式，收到 {a.size!r}",
+                  "hint": "例：--size 1024x1024"})
+            return 2
+        w, h = int(m.group(1)), int(m.group(2))
+        if w % 64 or h % 64:
+            emit({"ok": False, "error": "bad_size",
+                  "message": f"尺寸必须是 64 的倍数，收到 {w}x{h}",
+                  "hint": f"就近取值 {max(64, round(w/64)*64)}x{max(64, round(h/64)*64)}"})
+            return 2
+    prompt = a.prompt
+    if a.prompt_file:
+        if not os.path.isfile(a.prompt_file):
+            emit({"ok": False, "error": "prompt_file_not_found",
+                  "message": a.prompt_file})
+            return 2
+        prompt = open(a.prompt_file, encoding="utf-8").read()
+    if not prompt and not a.prompt_file:
+        emit({"ok": False, "error": "missing_prompt", "hint": "imgpool submit -m moss \"提示词\""})
+        return 2
+    ensure_daemon()
+    spec = {
+        "model": a.model,
+        "source": a.source,
+        "prompt": prompt,
+        "timeout": a.job_timeout,
+        "args": build_imggen_args(a, None if a.prompt_file else prompt),
+    }
+    r = cpost("/submit", spec, timeout=60)
+    job = r["job"]
+    print(f"[imgpool] 已入队 {job['id']} 位置={job['position']} "
+          f"model={job['model']} source={job['source']}", file=sys.stderr)
+    if not a.wait:
+        emit(r)
+        return 0
+    return cmd_wait(a, job["id"], r["job"])
+
+
+def cmd_wait(a, jid=None, first=None):
+    jid = jid or a.id
+    t0 = time.time()
+    last_state = None
+    wait_timeout = getattr(a, "timeout", None) or 1800
+    fails = 0
+    while time.time() - t0 < wait_timeout:
+        try:
+            r = cget(f"/job?id={urllib.parse.quote(jid)}")
+            fails = 0
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                emit({"ok": False, "error": "job_not_found", "id": jid,
+                      "hint": "任务池可能重启过；imgpool list 查看现存任务"})
+                return 3
+            fails += 1
+            r = None
+        except Exception:
+            fails += 1
+            r = None
+        if fails >= 5:
+            emit({"ok": False, "error": "daemon_unreachable", "id": jid,
+                  "message": "等待期间连续 5 次连不上任务池",
+                  "hint": "池可能被 stop 或崩溃；imgpool start 后可用 list 查看历史"})
+            return 3
+        if r is None:
+            time.sleep(1)
+            continue
+        job = r["job"]
+        if job["state"] != last_state:
+            last_state = job["state"]
+            print(f"[imgpool] {jid} → {job['state']} "
+                  f"pos={job.get('position')}", file=sys.stderr)
+        if job["state"] in ("done", "failed", "cancelled", "interrupted"):
+            res = job.get("result") or {}
+            out = {"ok": job["state"] == "done",
+                   "id": job["id"], "state": job["state"],
+                   "model": job["model"], "source": job["source"],
+                   "seconds": job["seconds"],
+                   "error": job.get("error"),
+                   "error_layer": job.get("error_layer"),
+                   "message": res.get("message") if isinstance(res, dict) else None,
+                   "result": job.get("result"),
+                   "prev": r.get("prev"), "next": r.get("next"),
+                   "queue": r.get("queue"),
+                   "cli_log": job.get("cli_log")}
+            emit(out)
+            return 0 if job["state"] == "done" else 6
+        time.sleep(1)
+    emit({"ok": False, "error": "wait_timeout", "id": jid,
+          "hint": "任务仍在跑；imgpool status --id 查看，或 --timeout 加大"})
+    return 6
+
+
+def _cget_or_emit(path, timeout=10):
+    """GET 失败时把服务端的结构化 JSON 原样吐给调用方，不再抛回溯。"""
+    try:
+        return cget(path, timeout)
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"ok": False, "error": f"http_{e.code}"}
+        body.setdefault("ok", False)
+        emit(body)
+    except Exception as e:
+        emit({"ok": False, "error": "daemon_unreachable",
+              "message": f"{type(e).__name__}: {e}",
+              "hint": "imgpool start"})
+    return None
+
+
+def _require_daemon():
+    if alive():
+        return True
+    emit({"ok": False, "error": "daemon_not_running",
+          "hint": "imgpool start  （或直接 imgpool submit，客户端会自动拉起）"})
+    return False
+
+
+def cmd_status(a):
+    if not _require_daemon():
+        return 3
+    if a.id:
+        r = _cget_or_emit(f"/job?id={urllib.parse.quote(a.id)}")
+        if r is None:
+            return 3
+        emit(r)
+        return 0
+    q = _cget_or_emit("/queue")
+    if q is None:
+        return 3
+    h = _cget_or_emit("/health")
+    emit({"ok": True, "queue": q["queue"], "health": h})
+    return 0
+
+
+def cmd_result(a):
+    if not _require_daemon():
+        return 3
+    r = _cget_or_emit(f"/job?id={urllib.parse.quote(a.id)}")
+    if r is None:
+        return 3
+    job = r["job"]
+    res = job.get("result") or {}
+    emit({"ok": job["state"] == "done", "id": a.id,
+          "state": job["state"],
+          "error": job.get("error"),
+          "error_layer": job.get("error_layer"),
+          "message": res.get("message") if isinstance(res, dict) else None,
+          "result": job.get("result"),
+          "prev": r.get("prev"), "next": r.get("next"),
+          "cli_log": job.get("cli_log")})
+    return 0 if job["state"] == "done" else 6
+
+
+def cmd_list(a):
+    if not _require_daemon():
+        return 3
+    limit = max(1, min(int(a.limit), 1000))
+    r = _cget_or_emit(f"/jobs?limit={limit}")
+    if r is None:
+        return 3
+    emit(r)
+    return 0
+
+
+def cmd_logs(a):
+    if a.pool:
+        emit({"ok": True, "pool_log": POOL_LOG, "tail": _tail(POOL_LOG, a.tail)})
+        return 0
+    if not a.id:
+        emit({"ok": False, "error": "need_id", "hint": "imgpool logs --id job_xxx 或 --pool"})
+        return 2
+    if not _require_daemon():
+        return 3
+    r = _cget_or_emit(f"/log?id={urllib.parse.quote(a.id)}&tail={max(1, a.tail)}")
+    if r is None:
+        return 3
+    emit(r)
+    return 0
+
+
+def cmd_cancel(a):
+    if not _require_daemon():
+        return 3
+    body = {"id": a.id}
+    if a.source:
+        body["source"] = a.source
+    if a.force:
+        body["force"] = True
+    try:
+        emit(cpost("/cancel", body))
+        return 0
+    except urllib.error.HTTPError as e:
+        try:
+            emit(json.loads(e.read().decode()))
+        except Exception:
+            emit({"ok": False, "error": f"http_{e.code}"})
+        return 3
+
+
+def cmd_start(a):
+    started = ensure_daemon()
+    emit({"ok": True, "already_running": not started, "health": cget("/health")})
+    return 0
+
+
+def _pid_is_imgpool(pid):
+    """只 kill 确认是 imgpool serve 的进程，避免 pid 文件被覆盖后误杀。"""
+    try:
+        raw = open(f"/proc/{pid}/cmdline", "rb").read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    parts = raw.split("\x00")
+    return any("imgpool" in x for x in parts) and "serve" in parts
+
+
+def cmd_stop(a):
+    force = bool(getattr(a, "force", False))
+    try:
+        r = cpost("/stop", {"force": force})
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read().decode())
+        except Exception:
+            body = {"ok": False, "error": f"http_{e.code}"}
+        body.setdefault("ok", False)
+        emit(body)
+        return 4 if e.code == 409 else 3
+    except Exception as e:
+        r = {"ok": True, "note": f"HTTP 停止请求失败：{type(e).__name__}: {e}"}
+
+    # 等进程真正退出，避免 stop && start 竞态
+    for _ in range(50):
+        if not alive():
+            emit(r)
+            return 0
+        time.sleep(0.2)
+
+    if force:
+        try:
+            pid = int(open(PID_FILE).read().strip())
+            if _pid_is_imgpool(pid):
+                os.kill(pid, signal.SIGTERM)
+                emit({**r, "ok": True, "pid_killed": pid,
+                      "note": "HTTP 已停但进程未退，按 pid 兜底（已校验进程身份）"})
+                return 0
+            emit({**r, "ok": False, "error": "pid_mismatch",
+                  "message": f"pid {pid} 不是 imgpool serve，拒绝 kill"})
+            return 1
+        except Exception as e2:
+            emit({**r, "ok": False, "error": "still_running",
+                  "message": f"{type(e2).__name__}: {e2}"})
+            return 1
+
+    emit({**r, "ok": False, "error": "still_running",
+          "hint": "进程 10 秒内未退出；imgpool stop --force"})
+    return 1
+
+
+def build_parser():
+    class JsonParser(argparse.ArgumentParser):
+        def error(self, message):
+            emit({"ok": False, "error": "bad_args", "message": message,
+                  "hint": "imgpool <command> --help"})
+            sys.exit(2)
+
+    ap = JsonParser(prog="imgpool", description="并行出图任务池")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("serve", help="前台运行任务池服务")
+    p.add_argument("--port", type=int, default=PORT)
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    p.add_argument("--idle-stop-seconds", type=int, default=IDLE_STOP_SECONDS,
+                   help="无请求这么久后关闭 ComfyUI（0=禁用，默认 900）")
+
+    sub.add_parser("start", help="启动后台服务")
+    p = sub.add_parser("stop", help="停止后台服务（有任务在跑时需 --force）")
+    p.add_argument("--force", action="store_true",
+                   help="中断正在跑的任务并停止服务")
+
+    p = sub.add_parser("submit", help="提交任务（默认等待完成）")
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("-m", "--model", default="moss")
+    p.add_argument("--source", default="cli", help="调用方标识，写日志用")
+    p.add_argument("--prompt-file")
+    p.add_argument("--seed")
+    p.add_argument("--preset")
+    p.add_argument("--size")
+    p.add_argument("--width", type=int)
+    p.add_argument("--height", type=int)
+    p.add_argument("--steps", type=int)
+    p.add_argument("--steps2", type=int)
+    p.add_argument("--cfg", type=float)
+    p.add_argument("--denoise", type=float)
+    p.add_argument("--denoise2", type=float)
+    p.add_argument("--scale", type=float)
+    p.add_argument("--lora", action="append", default=[])
+    p.add_argument("--lora-strength", type=float)
+    p.add_argument("--edit")
+    p.add_argument("--edit-strength", type=float)
+    p.add_argument("--out")
+    p.add_argument("--allow-risky", action="store_true")
+    p.add_argument("--no-restart", action="store_true")
+    p.add_argument("--queue-wait", type=int)
+    p.add_argument("--lock-wait", type=int)
+    p.add_argument("--timeout", dest="job_timeout", type=int, default=DEFAULT_TIMEOUT,
+                   help="单个任务的超时（秒），传给池")
+    p.add_argument("--wait", dest="wait", action="store_true", default=True)
+    p.add_argument("--no-wait", dest="wait", action="store_false")
+
+    p = sub.add_parser("wait", help="按 id 等待任务")
+    p.add_argument("--id", required=True)
+    p.add_argument("--timeout", type=int, default=1800)
+
+    p = sub.add_parser("status", help="当前排队；带 --id 查单个任务")
+    p.add_argument("--id")
+
+    p = sub.add_parser("result", help="按 id 取结果（含上一张/下一张）")
+    p.add_argument("--id", required=True)
+
+    p = sub.add_parser("list", help="列出最近任务")
+    p.add_argument("--limit", type=int, default=20)
+
+    p = sub.add_parser("logs", help="看日志")
+    p.add_argument("--id")
+    p.add_argument("--pool", action="store_true")
+    p.add_argument("--tail", type=int, default=200)
+
+    p = sub.add_parser("cancel", help="取消任务")
+    p.add_argument("--id", required=True)
+    p.add_argument("--source", help="调用方标识，用于阻止误取消他人任务")
+    p.add_argument("--force", action="store_true", help="强制取消他人任务")
+
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+    if a.cmd == "serve":
+        serve(a.port, a.concurrency, a.idle_stop_seconds)
+        return 0
+    if a.cmd == "submit":
+        return cmd_submit(a)
+    if a.cmd == "wait":
+        return cmd_wait(a)
+    if a.cmd == "status":
+        return cmd_status(a)
+    if a.cmd == "result":
+        return cmd_result(a)
+    if a.cmd == "list":
+        return cmd_list(a)
+    if a.cmd == "logs":
+        return cmd_logs(a)
+    if a.cmd == "cancel":
+        return cmd_cancel(a)
+    if a.cmd == "start":
+        return cmd_start(a)
+    if a.cmd == "stop":
+        return cmd_stop(a)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        emit({"ok": False, "error": "interrupted"})
+        sys.exit(130)
+    except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        emit({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        sys.exit(1)

@@ -1,0 +1,28 @@
+# Example systemd --user unit for comfy-imgpool.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp examples/imgpool.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now imgpool.service
+#   loginctl enable-linger "$USER"     # optional: run without an active login
+#
+# Edit the paths and the ComfyUI unit name before enabling.
+
+[Unit]
+Description=comfy-imgpool — image generation task pool
+
+[Service]
+Type=simple
+WorkingDirectory=%h/comfy-imgpool
+Environment=COMFY_ROOT=%h/AI_gen_video_img
+Environment=COMFY_URL=http://127.0.0.1:8188
+Environment=COMFY_UNIT=comfyui-2k
+Environment=IMGPOOL_QUIET=1
+ExecStart=%h/comfy-imgpool/bin/imgpool serve --port 8199 --concurrency 1 --idle-stop-seconds 900
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,926 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""imggen — 给 LLM / 脚本用的 ComfyUI 出图单入口。
+
+设计目标：LLM 只需要 `imggen --list` 和 `imggen "提示词"` 两条命令，
+所有加速细节（int8/int4、HIP attention、二采、VAE 选择、内存保护）都封装在这里。
+
+  imggen --list                                   # JSON 能力清单
+  imggen "提示词"                                  # 默认 moss / 1024² / 4 步
+  imggen -m anima "提示词"                         # 1024→1536 二采，12 秒
+  imggen -m krea2 --preset 2k "提示词"             # 1152×2048 二采，27 秒
+  imggen -m moss --size 1024 "提示词"
+  imggen -m anima --width 1344 --height 768 "提示词"   # 自定义尺寸走单采
+  imggen -m anima --lora modern-anime-lora:0.8 "提示词"
+  imggen --edit a.png "把剑换成蓝色能量刃"          # MOSS 参考图编辑
+  imggen --dry -m krea2 "x"                        # 只打印 API graph
+
+stdout 永远只有一行 JSON；进度和日志走 stderr。
+退出码：0 成功 / 2 参数错误 / 3 服务不可用 / 4 内存不足 /
+        5 提交被拒（附 node_errors）/ 6 执行失败或超时。
+"""
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime
+
+def _find_comfy_root():
+    """定位 ComfyUI 项目根目录：COMFY_ROOT > 向上查找含 ComfyUI/ 的目录。"""
+    env = os.environ.get("COMFY_ROOT")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    here = os.path.dirname(os.path.realpath(__file__))
+    for base in (os.getcwd(), here):
+        d = base
+        for _ in range(5):
+            if os.path.isdir(os.path.join(d, "ComfyUI")):
+                return d
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+    return os.path.dirname(here)
+
+ROOT = _find_comfy_root()
+COMFY_DIR = os.environ.get("COMFY_DIR", os.path.join(ROOT, "ComfyUI"))
+OUTPUT_DIR = os.path.join(COMFY_DIR, "output")
+INPUT_DIR = os.path.join(COMFY_DIR, "input")
+ENSURE = os.environ.get("COMFY_ENSURE", os.path.join(ROOT, "bin", "comfy-ensure.sh"))
+LOG = os.environ.get("COMFY_LOG", os.path.join(ROOT, "logs", "comfy-2k.log"))
+STATE_DIR = os.environ.get("IMGPOOL_STATE_DIR", "/tmp/comfy-imgpool")
+os.makedirs(STATE_DIR, exist_ok=True)
+LOCK_PATH = os.path.join(STATE_DIR, "imggen.lock")
+ACTIVITY_FILE = os.environ.get("IMGPOOL_ACTIVITY_FILE",
+                               os.path.join(STATE_DIR, "comfy-last-activity"))
+BASE = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+
+GB = 1024 ** 3
+
+
+# ----------------------------------------------------------------------------
+# 模型与预设表（数字全部来自本机实测，见 Krea2-gfx1030-加速.md）
+# ----------------------------------------------------------------------------
+MODELS = {
+    "moss": {
+        "display": "MOSS Image SFT int8（Flux2 VAE）",
+        "unet": "moss_image_sft_int8_convrot.safetensors",
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors",
+                 "type": "moss_image", "device": "default"},
+        "vae": "flux2-vae.safetensors",
+        # MOSS 不认 fused_norm / fused_swiglu，只开 hip + int8_gemm
+        "accel": {"backend": "hip", "transpose_weights": False,
+                  "int8_gemm": True, "fused_norm": False, "fused_swiglu": False},
+        "min_avail_gb": 7.5,          # 9B 文本编码器 7GB + UNET 5.2GB 分时驻留
+        "vram_need_gb": 12.5,         # 清空后运行所需峰值（TE 7GB + UNET 5.2GB + 余量）
+        "custom_steps": 4,
+        "edit_lora": "moss_image_edit_lora_rank_64_bf16.safetensors",
+        "notes": "采样只占 2 秒；VAE 必须用普通解码（分块慢 100 倍）。首次冷启动约 45 秒。",
+        "presets": {
+            "1024": dict(width=1024, height=1024, steps=4, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         est_seconds=9.0),
+        },
+        "risky_presets": {
+            "1536": dict(width=1536, height=1536, steps=4, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         est_seconds=None),
+        },
+    },
+    "anima": {
+        "display": "Anima Turbo V10 int8 convrot（Qwen Image VAE）",
+        "unet": "anima_turboV10_int8_convrot.safetensors",
+        "clip": {"clip_name": "qwen_3_06b_base.safetensors",
+                 "type": "stable_diffusion", "device": "default"},
+        "vae": "qwen_image_vae.safetensors",
+        # Anima 的 attention 走 SDPA，不经优化节点；只有 int8_gemm 生效
+        "accel": {"backend": "hip", "transpose_weights": False,
+                  "int8_gemm": True, "fused_norm": False, "fused_swiglu": False},
+        "min_avail_gb": 3.0,
+        "vram_need_gb": 6.0,
+        "custom_steps": 10,
+        "notes": "attention 绕过 RDNA2 节点，只有 int8 GEMM 生效。分辨率越高 int8 优势越大。",
+        "presets": {
+            "fast": dict(width=1024, height=1024, steps=8, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         two_pass=True, scale=1.5, steps2=4, denoise2=0.3,
+                         est_seconds=13.0),
+            "1536": dict(width=1536, height=1536, steps=10, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         est_seconds=18.0),
+            "1024": dict(width=1024, height=1024, steps=10, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         est_seconds=7.0),
+        },
+        "risky_presets": {},
+    },
+    "krea2": {
+        "display": "Krea2 Turbo int4 convrot（Qwen Image VAE）",
+        "unet": "krea2_turbo-int4_convrot.safetensors",
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+                 "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors",
+        "accel": {"backend": "hip", "transpose_weights": False,
+                  "int8_gemm": True, "fused_norm": True, "fused_swiglu": True},
+        "min_avail_gb": 8.0,          # int4 权重 6.9GB；低于 8GB 才重启
+        "vram_need_gb": 12.0,         # int4 6.6GB + TE 5GB 分时驻留 + 2K latent 余量
+        "custom_steps": 8,
+        "notes": "int4 与 int8 不同构图（同 seed SSIM 0.53）。2K 二采 4 步与 8 步 SSIM 0.944。",
+        "presets": {
+            "2k": dict(width=720, height=1280, steps=8, cfg=1.0,
+                       sampler="euler", scheduler="simple", denoise=1.0,
+                       two_pass=True, scale=1.6, steps2=4, denoise2=0.25,
+                       est_seconds=27.2),
+            "720p": dict(width=720, height=1280, steps=8, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         est_seconds=10.1),
+        },
+        "risky_presets": {},
+    },
+}
+
+DEFAULT_MODEL = "moss"
+DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
+
+
+# ----------------------------------------------------------------------------
+# 输出 / 错误
+# ----------------------------------------------------------------------------
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False), flush=True)
+
+
+def fail(code, err, message, hint=None, **extra):
+    d = {"ok": False, "error": err, "message": message}
+    if hint:
+        d["hint"] = hint
+    d.update(extra)
+    emit(d)
+    sys.exit(code)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def touch_activity():
+    """给 imgpool 的空闲监控续命；直接调用 imggen 时也能覆盖到。"""
+    try:
+        os.makedirs(os.path.dirname(ACTIVITY_FILE), exist_ok=True)
+        with open(ACTIVITY_FILE, "a"):
+            os.utime(ACTIVITY_FILE, None)
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------------------
+# HTTP
+# ----------------------------------------------------------------------------
+def http_json(path, data=None, timeout=120):
+    url = BASE + path
+    if data is None:
+        req = urllib.request.Request(url)
+    else:
+        req = urllib.request.Request(
+            url, data=json.dumps(data).encode(),
+            headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = r.read()
+    return json.loads(body) if body else {}
+
+
+def http_post(path, data=b"{}", timeout=30):
+    req = urllib.request.Request(BASE + path, data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status
+
+
+def service_up(timeout=3):
+    try:
+        http_json("/system_stats", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def system_stats():
+    return http_json("/system_stats", timeout=10)["devices"][0]
+
+
+# ----------------------------------------------------------------------------
+# 内存 / 服务保护
+# ----------------------------------------------------------------------------
+def meminfo():
+    vals = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            vals[k] = int(v.strip().split()[0]) * 1024
+    avail = vals.get("MemAvailable", 0)
+    swap_total = vals.get("SwapTotal", 0)
+    swap_free = vals.get("SwapFree", 0)
+    return avail, swap_total - swap_free
+
+
+def mem_check(min_gb):
+    """返回 (ok, 描述)。available 不足或 zram 已用过多都视为低内存。"""
+    avail, swap_used = meminfo()
+    reasons = []
+    if avail < min_gb * GB:
+        reasons.append(f"可用内存 {avail / GB:.1f}GB < 门槛 {min_gb:.1f}GB")
+    if swap_used > 8 * GB:
+        reasons.append(f"zram 已用 {swap_used / GB:.1f}GB > 8GB（有残留）")
+    return (not reasons), "; ".join(reasons), avail, swap_used
+
+
+def ensure_service(force=False):
+    """调用 comfy-ensure.sh。返回 (started, restarted, detail)。"""
+    if not os.path.exists(ENSURE):
+        fail(3, "ensure_script_missing", f"找不到 {ENSURE}",
+             "设置 COMFY_ROOT 或 COMFY_ENSURE，或先手动启动 ComfyUI")
+    try:
+        p = subprocess.run(["bash", ENSURE] + (["-f"] if force else []),
+                           capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        fail(3, "service_start_timeout", "comfy-ensure.sh 超过 300 秒未返回",
+             "手动运行 bin/comfy-ensure.sh -f 检查日志 logs/comfy-2k.log")
+    detail = (p.stdout or p.stderr or "").strip().splitlines()
+    detail = detail[-1] if detail else ""
+    if p.returncode != 0:
+        fail(3, "service_start_failed",
+             f"comfy-ensure.sh 退出码 {p.returncode}: {detail}",
+             f"查看 {LOG} 尾部日志")
+    if not service_up(timeout=20):
+        fail(3, "service_not_ready", "服务启动后 20 秒仍无法访问 /system_stats",
+             f"查看 {LOG}")
+    return (not force), force, detail
+
+
+def queue_counts():
+    q = http_json("/queue", timeout=10)
+    return len(q.get("queue_running") or []), len(q.get("queue_pending") or [])
+
+
+def wait_queue_idle(max_wait):
+    """避免和别的任务并发把内存顶爆。"""
+    t0 = time.time()
+    warned = False
+    while time.time() - t0 < max_wait:
+        run, pend = queue_counts()
+        if run == 0 and pend == 0:
+            return
+        if not warned:
+            log(f"[imggen] 队列非空（running={run} pending={pend}），等待空闲…")
+            warned = True
+        time.sleep(2)
+    fail(6, "queue_busy", f"{max_wait}s 内队列一直非空，未提交以避免并发 OOM",
+         "等当前任务结束，或加大 --queue-wait")
+
+
+def acquire_lock(max_wait):
+    """同一时刻只允许一个 imggen 实例，避免并发挤爆显存/内存。"""
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    fh = open(LOCK_PATH, "w")
+    t0 = time.time()
+    warned = False
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fh.write(str(os.getpid()))
+            fh.flush()
+            return fh
+        except BlockingIOError:
+            touch_activity()
+            if time.time() - t0 > max_wait:
+                fail(6, "lock_timeout",
+                     f"{max_wait}s 内未拿到出图锁，另一个 imggen 正在跑",
+                     "等它结束，或加大 --lock-wait")
+            if not warned:
+                log("[imggen] 另一个 imggen 正在运行，排队等待…")
+                warned = True
+            time.sleep(1)
+
+
+# ----------------------------------------------------------------------------
+# 节点图构造（API 格式）
+# ----------------------------------------------------------------------------
+def build_graph(a, spec, prompt_text, edit_image):
+    g = {}
+
+    def add(nid, ctype, inputs):
+        g[str(nid)] = {"class_type": ctype, "inputs": inputs}
+
+    add(1, "UNETLoader", {"unet_name": MODELS[a.model]["unet"],
+                          "weight_dtype": "default"})
+    model_ref = ["1", 0]
+
+    # LoRA 链（用户 LoRA 在前，MOSS edit LoRA 在后）
+    loras = list(a.loras)
+    if edit_image:
+        loras.append((MODELS[a.model]["edit_lora"], 1.0))
+    for i, (name, strength) in enumerate(loras):
+        nid = 30 + i
+        add(nid, "LoraLoaderModelOnly",
+            {"model": model_ref, "lora_name": name, "strength_model": strength})
+        model_ref = [str(nid), 0]
+
+    accel = MODELS[a.model]["accel"]
+    add(20, "RDNA2Attention", {"model": model_ref, **accel})
+    model_ref = ["20", 0]
+
+    add(3, "CLIPLoader", dict(MODELS[a.model]["clip"]))
+    add(4, "VAELoader", {"vae_name": MODELS[a.model]["vae"]})
+
+    if edit_image:
+        # MOSS edit：参考图 -> TextEncodeMOSSImageEdit；negative 用 ZeroOut 省一次 9B 前向
+        add(40, "LoadImage", {"image": edit_image, "upload": "image"})
+        add(41, "TextEncodeMOSSImageEdit", {
+            "clip": ["3", 0], "prompt": prompt_text, "vae": ["4", 0],
+            "edit_format": "Moss-Image-Edit",
+            # Autogrow 输入必须是扁平键名，嵌套 dict 会报 required input is missing
+            "images.image_0": ["40", 0],
+            "image_strength": a.edit_strength,
+        })
+        add(42, "ConditioningZeroOut", {"conditioning": ["41", 0]})
+        pos, neg = ["41", 0], ["42", 0]
+    else:
+        add(5, "CLIPTextEncode", {"text": prompt_text, "clip": ["3", 0]})
+        add(6, "ConditioningZeroOut", {"conditioning": ["5", 0]})
+        pos, neg = ["5", 0], ["6", 0]
+
+    # 采样前卸载文本编码器（MOSS 7GB 必须；其他模型也无害）
+    add(19, "ForceUnloadModels",
+        {"model": model_ref, "positive": pos, "negative": neg})
+
+    seed = a.seed
+    add(7, "EmptyLatentImage",
+        {"width": spec["width"], "height": spec["height"], "batch_size": 1})
+    add(8, "KSampler", {
+        "model": ["19", 0], "seed": seed, "steps": spec["steps"],
+        "cfg": spec["cfg"], "sampler_name": spec["sampler"],
+        "scheduler": spec["scheduler"], "positive": pos, "negative": neg,
+        "latent_image": ["7", 0], "denoise": spec["denoise"],
+    })
+    last = ["8", 0]
+
+    if spec.get("two_pass"):
+        add(9, "LatentUpscaleBy", {
+            "samples": last, "upscale_method": spec.get("upscale_method", "bislerp"),
+            "scale_by": spec["scale"],
+        })
+        add(10, "KSampler", {
+            "model": ["19", 0], "seed": seed, "steps": spec["steps2"],
+            "cfg": spec["cfg"], "sampler_name": spec["sampler"],
+            "scheduler": spec["scheduler"], "positive": pos, "negative": neg,
+            "latent_image": ["9", 0], "denoise": spec["denoise2"],
+        })
+        last = ["10", 0]
+
+    add(11, "VAEDecode", {"samples": last, "vae": ["4", 0]})
+    add(12, "SaveImage", {"images": ["11", 0], "filename_prefix": a.out})
+    return g
+
+
+# ----------------------------------------------------------------------------
+# 尺寸 / 参数
+# ----------------------------------------------------------------------------
+def round64(v):
+    return max(64, int(round(v / 64.0)) * 64)
+
+
+def resolve_spec(a, model):
+    """返回 (spec, preset_name, custom)。--size/--width/--height 走单采。"""
+    cfg = MODELS[model]
+    custom = a.size is not None or a.width is not None or a.height is not None
+
+    if custom:
+        if a.size:
+            m = re.fullmatch(r"(\d+)\s*[xX\u00d7]\s*(\d+)", a.size.strip())
+            if not m:
+                fail(2, "bad_size", f"--size 需要 WxH 格式，收到 {a.size!r}",
+                     "例：--size 1024x1536")
+            w, h = int(m.group(1)), int(m.group(2))
+        else:
+            w = a.width or cfg["presets"][DEFAULT_PRESET[model]]["width"]
+            h = a.height or cfg["presets"][DEFAULT_PRESET[model]]["height"]
+        if w % 64 or h % 64:
+            fail(2, "bad_size", f"自定义尺寸必须是 64 的倍数，收到 {w}x{h}",
+                 f"就近取值：{round64(w)}x{round64(h)}")
+        if w * h > 2048 * 2048:
+            fail(2, "size_too_large",
+                 f"{w}x{h} 超过本机已验证上限 2048x2048",
+                 "这台机器 23GB 内存在 2048² 会卡死，建议 ≤1536²")
+        spec = dict(width=w, height=h, steps=a.steps or cfg["custom_steps"],
+                    cfg=1.0 if a.cfg is None else a.cfg,
+                    sampler="euler", scheduler="simple", denoise=1.0)
+        return spec, f"custom-{w}x{h}", True
+
+    preset = a.preset or DEFAULT_PRESET[model]
+    if preset in cfg["presets"]:
+        spec = dict(cfg["presets"][preset])
+    elif preset in cfg.get("risky_presets", {}):
+        if not a.allow_risky:
+            fail(2, "risky_preset",
+                 f"{model}/{preset} 未验证且曾把服务跑挂",
+                 "确定要试就加 --allow-risky")
+        spec = dict(cfg["risky_presets"][preset])
+    else:
+        avail = sorted(list(cfg["presets"]) + list(cfg.get("risky_presets", {})))
+        fail(2, "bad_preset", f"{model} 没有预设 {preset!r}", f"可选：{', '.join(avail)}")
+
+    # 显式覆盖
+    if a.steps is not None:
+        spec["steps"] = a.steps
+    if a.steps2 is not None and spec.get("two_pass"):
+        spec["steps2"] = a.steps2
+    if a.cfg is not None:
+        spec["cfg"] = a.cfg
+    if a.denoise is not None:
+        spec["denoise"] = a.denoise
+    if a.denoise2 is not None and spec.get("two_pass"):
+        spec["denoise2"] = a.denoise2
+    if a.scale is not None and spec.get("two_pass"):
+        spec["scale"] = a.scale
+        out_w = spec["width"] * a.scale
+        out_h = spec["height"] * a.scale
+        if abs(out_w - round(out_w / 8) * 8) > 0.51 or abs(out_h - round(out_h / 8) * 8) > 0.51:
+            fail(2, "bad_scale",
+                 f"二采输出 {out_w:g}x{out_h:g} 不是 8 的倍数，VAE 解码会从 1.5s 变 124s",
+                 "换一个让输出对齐 8 的 scale（如 1.5 / 1.6 / 2.0）")
+    return spec, preset, False
+
+
+def resolve_loras(a):
+    """解析 --lora NAME[:STRENGTH]，NAME 可写全名或省略 .safetensors。"""
+    if not a.lora:
+        return []
+    try:
+        info = http_json("/object_info/LoraLoaderModelOnly", timeout=20)
+        names = info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0]
+    except Exception:
+        fail(3, "service_not_ready", "无法从 ComfyUI 读取 LoRA 列表",
+             "先运行 bin/comfy-ensure.sh")
+    out = []
+    for item in a.lora:
+        name, strength = item, a.lora_strength
+        if ":" in item:
+            maybe_name, maybe_s = item.rsplit(":", 1)
+            try:
+                strength = float(maybe_s)
+                name = maybe_name
+            except ValueError:
+                pass
+        if name not in names:
+            if name + ".safetensors" in names:
+                name += ".safetensors"
+            else:
+                fail(2, "unknown_lora", f"LoRA 不存在：{name}",
+                     "可用：" + ", ".join(names))
+        out.append((name, strength))
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 提交与等待
+# ----------------------------------------------------------------------------
+def submit(graph):
+    try:
+        return http_json("/prompt", {"prompt": graph,
+                                     "client_id": str(uuid.uuid4())})
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(raw)
+        except Exception:
+            body = {"raw": raw[:1200]}
+        ne = body.get("node_errors") or {}
+        msgs = []
+        for nid, info in ne.items():
+            for err in info.get("errors", []):
+                msgs.append(f"[{nid}] {err.get('message')}: {err.get('details')}")
+        fail(5, "prompt_rejected",
+             "ComfyUI 拒绝了节点图: " + ("; ".join(msgs) or raw[:600]),
+             "加 --dry 检查生成的 graph", node_errors=ne)
+    except urllib.error.URLError:
+        fail(3, "service_unreachable", f"连不上 {BASE}",
+             "运行 bin/comfy-ensure.sh 或检查 systemctl --user status comfyui-2k")
+
+
+def wait_done(pid, timeout):
+    t0 = time.time()
+    errs = 0
+    last = 0
+    while time.time() - t0 < timeout:
+        try:
+            h = http_json(f"/history/{pid}", timeout=20)
+            errs = 0
+        except Exception:
+            errs += 1
+            if errs >= 5:
+                fail(6, "server_died", "连续 5 次访问不到服务，ComfyUI 可能已崩溃",
+                     f"查看 {LOG} 尾部；重启用 bin/comfy-ensure.sh -f")
+            time.sleep(2)
+            continue
+        if pid in h:
+            return h[pid], time.time() - t0
+        touch_activity()
+        el = int(time.time() - t0)
+        if el // 10 != last // 10:
+            last = el
+            log(f"[imggen] …{el}s")
+        time.sleep(1)
+    try:
+        http_post("/interrupt", timeout=5)
+    except Exception:
+        pass
+    fail(6, "timeout", f"{timeout}s 内未完成，已尝试中断",
+         "加大 --timeout，或换更小的 --size")
+
+
+def collect_images(entry):
+    paths = []
+    for out in (entry.get("outputs") or {}).values():
+        for img in out.get("images") or []:
+            if img.get("type", "output") != "output":
+                continue
+            paths.append(os.path.join(OUTPUT_DIR, img.get("subfolder") or "",
+                                      img["filename"]))
+    return paths
+
+
+def entry_error(entry):
+    st = entry.get("status") or {}
+    if st.get("status_str") != "error" and st.get("completed", True):
+        return None
+    for msg in st.get("messages") or []:
+        if isinstance(msg, list) and len(msg) == 2 and msg[0] in (
+                "execution_error", "execution_interrupted"):
+            d = msg[1] or {}
+            return (msg[0], d.get("node_type"), d.get("exception_message") or d)
+    return ("execution_error", None, json.dumps(st, ensure_ascii=False)[:800])
+
+
+# ----------------------------------------------------------------------------
+# --list
+# ----------------------------------------------------------------------------
+def do_list():
+    models = []
+    for name, cfg in MODELS.items():
+        presets = []
+        for pname, p in list(cfg["presets"].items()) + list(cfg.get("risky_presets", {}).items()):
+            risky = pname in cfg.get("risky_presets", {})
+            item = {
+                "preset": pname,
+                "width": p["width"], "height": p["height"],
+                "steps": p["steps"], "cfg": p["cfg"],
+                "sampler": p["sampler"], "scheduler": p["scheduler"],
+                "estimated_seconds_hot": p.get("est_seconds"),
+                "risky": risky,
+            }
+            if p.get("two_pass"):
+                item.update({
+                    "two_pass": True, "scale": p["scale"],
+                    "steps2": p["steps2"], "denoise2": p["denoise2"],
+                    "output_width": int(p["width"] * p["scale"]),
+                    "output_height": int(p["height"] * p["scale"]),
+                })
+                item.pop("estimated_seconds_hot")
+                item["estimated_seconds_hot"] = p.get("est_seconds")
+            presets.append(item)
+        models.append({
+            "model": name,
+            "display": cfg["display"],
+            "default_preset": DEFAULT_PRESET[name],
+            "unet": cfg["unet"],
+            "vae": cfg["vae"],
+            "min_available_memory_gb": cfg["min_avail_gb"],
+            "min_free_vram_gb": cfg["vram_need_gb"],
+            "supports_edit": name == "moss",
+            "notes": cfg["notes"],
+            "presets": presets,
+        })
+    try:
+        info = http_json("/object_info/LoraLoaderModelOnly", timeout=10)
+        loras = info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0]
+    except Exception:
+        loras = []
+    emit({
+        "ok": True,
+        "service": {"url": BASE, "up": service_up()},
+        "default_model": DEFAULT_MODEL,
+        "models": models,
+        "loras": loras,
+        "usage": [
+            'imggen "提示词"',
+            'imggen -m anima "提示词"',
+            'imggen -m krea2 --preset 2k "提示词"',
+            'imggen -m anima --size 1344x768 "提示词"',
+            'imggen -m anima --lora modern-anime-lora:0.8 "提示词"',
+            'imggen --edit 图片路径 "编辑指令"',
+        ],
+        "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
+                       "4": "内存不足", "5": "提交被拒", "6": "执行失败或超时"},
+    })
+
+
+# ----------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------
+def build_parser():
+    class JsonParser(argparse.ArgumentParser):
+        def error(self, message):
+            fail(2, "bad_args", message, "运行 imggen --list 查看完整能力清单")
+
+    ap = JsonParser(
+        prog="imggen", description="LLM 友好的 ComfyUI 出图 CLI（gfx1030 加速版）")
+    ap.add_argument("prompt", nargs="?", help="提示词")
+    ap.add_argument("-p", "--prompt", dest="prompt_opt", help="提示词（同位置参数）")
+    ap.add_argument("--prompt-file", help="从文件读提示词")
+    ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
+                    help="moss / anima / krea2（默认 moss）")
+    ap.add_argument("--preset", help="预设名，见 --list")
+    ap.add_argument("--size", help="自定义尺寸 WxH（走单采，必须 64 对齐）")
+    ap.add_argument("--width", type=int)
+    ap.add_argument("--height", type=int)
+    ap.add_argument("--seed", default="424242", help="整数或 random")
+    ap.add_argument("--steps", type=int, help="覆盖首采步数")
+    ap.add_argument("--steps2", type=int, help="覆盖二采步数")
+    ap.add_argument("--cfg", type=float, help="覆盖 cfg")
+    ap.add_argument("--denoise", type=float, help="覆盖首采 denoise")
+    ap.add_argument("--denoise2", type=float, help="覆盖二采 denoise")
+    ap.add_argument("--scale", type=float, help="覆盖二采放大倍数")
+    ap.add_argument("--lora", action="append", default=[],
+                    help="LoRA 名[:强度]，可重复")
+    ap.add_argument("--lora-strength", type=float, default=1.0,
+                    help="未写强度时的默认 LoRA 强度")
+    ap.add_argument("--edit", metavar="IMAGE", help="MOSS 参考图编辑的输入图片")
+    ap.add_argument("--edit-strength", type=float, default=1.0)
+    ap.add_argument("--out", help="SaveImage 文件名前缀")
+    ap.add_argument("--timeout", type=int, default=900)
+    ap.add_argument("--queue-wait", type=int, default=600)
+    ap.add_argument("--lock-wait", type=int, default=600)
+    ap.add_argument("--no-restart", action="store_true",
+                    help="内存不足时不自动重启服务，直接失败")
+    ap.add_argument("--allow-risky", action="store_true",
+                    help="允许未验证的高分辨率预设")
+    ap.add_argument("--dry", action="store_true", help="只打印 API graph")
+    ap.add_argument("--list", action="store_true", help="输出 JSON 能力清单")
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+
+    if a.list:
+        do_list()
+        return 0
+
+    prompt = a.prompt_opt or a.prompt
+    if a.prompt_file:
+        prompt = open(a.prompt_file, encoding="utf-8").read()
+
+    if a.model not in MODELS:
+        fail(2, "bad_model", f"未知模型 {a.model!r}",
+             "可选：" + ", ".join(sorted(MODELS)))
+
+    if not prompt or not prompt.strip():
+        fail(2, "missing_prompt", "没有提示词",
+             '用法：imggen "一只猫"；能力清单：imggen --list')
+
+    if a.edit and a.model != "moss":
+        fail(2, "bad_edit_model", "--edit 只有 moss 支持",
+             "imggen -m moss --edit 图片路径 \"指令\"")
+
+    # seed
+    if str(a.seed).lower() in ("random", "rand", "r"):
+        a.seed = random.randrange(0, 2 ** 32)
+    else:
+        try:
+            a.seed = int(a.seed)
+        except ValueError:
+            fail(2, "bad_seed", f"--seed 需要整数或 random，收到 {a.seed!r}")
+
+    # LoRA（需要服务在线，先确保）
+    if a.lora and not service_up():
+        ensure_service()
+    a.loras = resolve_loras(a)
+
+    spec, preset, custom = resolve_spec(a, a.model)
+
+    # 参考图：复制到 ComfyUI/input 并哈希去重
+    edit_name = None
+    if a.edit:
+        src = os.path.abspath(os.path.expanduser(a.edit))
+        if not os.path.isfile(src):
+            fail(2, "edit_not_found", f"参考图不存在：{src}")
+        ext = os.path.splitext(src)[1].lower() or ".png"
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            fail(2, "bad_edit_image", f"不支持的图片格式：{ext}")
+        h = hashlib.sha1(open(src, "rb").read()).hexdigest()[:12]
+        edit_name = f"imggen_edit_{h}{ext}"
+        os.makedirs(INPUT_DIR, exist_ok=True)
+        dst = os.path.join(INPUT_DIR, edit_name)
+        if not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+
+    if not a.out:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        a.out = f"imggen_{a.model}_{ts}"
+
+    graph = build_graph(a, spec, prompt, edit_name)
+
+    if a.dry:
+        emit({"ok": True, "dry": True, "model": a.model, "preset": preset,
+              "spec": spec, "seed": a.seed, "graph": graph})
+        return 0
+
+    # 只有真正出图才刷新空闲计时（--list / --dry / 参数错误都不算请求）
+    touch_activity()
+
+    # 串行 + 服务 + 内存
+    lock = acquire_lock(a.lock_wait)
+    started = restarted = False
+
+    if not service_up():
+        touch_activity()
+        _, _, detail = ensure_service()
+        touch_activity()
+        started = True
+        log(f"[imggen] 服务已拉起：{detail}")
+
+    wait_queue_idle(a.queue_wait)
+
+    min_gb = MODELS[a.model]["min_avail_gb"]
+    ok, why, avail, swap_used = mem_check(min_gb)
+    if not ok:
+        if a.no_restart:
+            lock.close()
+            fail(4, "low_memory", f"{why}（--no-restart，未重启）",
+                 "释放内存后重试，或去掉 --no-restart 让脚本自动重启")
+        log(f"[imggen] 内存不足（{why}），自动重启 ComfyUI…")
+        touch_activity()
+        ensure_service(force=True)
+        touch_activity()
+        restarted = True
+        # 等内存回落，最多 90 秒
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            ok, why, avail, swap_used = mem_check(min_gb)
+            if ok:
+                break
+            time.sleep(3)
+        if not ok:
+            lock.close()
+            fail(4, "low_memory", f"重启后仍然内存不足：{why}",
+                 "zram 活锁一般需要彻底重启机器；先 pkill ComfyUI 等内存回落")
+
+    freed = False
+    # --highvram 下 ComfyUI 不会主动卸载旧模型，换模型时必须先清空，
+    # 否则旧模型(最多 7GB) + 新模型峰值会顶爆 16GB。
+    state_path = os.path.join(STATE_DIR, "imggen.lastmodel")
+    last_model = None
+    try:
+        last_model = open(state_path).read().strip() or None
+    except Exception:
+        pass
+    switched = last_model != a.model
+
+    def free_vram():
+        try:
+            http_post("/free", json.dumps(
+                {"unload_models": True, "free_memory": True}).encode())
+            time.sleep(2)
+            return True
+        except Exception:
+            return False
+
+    def vfree_gb():
+        try:
+            return system_stats()["vram_free"] / GB
+        except Exception:
+            return None
+
+    peak = MODELS[a.model]["vram_need_gb"]
+    if switched:
+        log(f"[imggen] 切换模型 {last_model or '(空)'} → {a.model}，先卸载旧模型…")
+        freed = free_vram()
+    vfree = vfree_gb()
+    need = peak if (switched or freed) else 0.5
+    if vfree is not None and vfree < need:
+        log(f"[imggen] 空闲显存 {vfree:.1f}GB < 需要 {need:.1f}GB，卸载已加载模型…")
+        freed = free_vram() or freed
+        vfree = vfree_gb()
+        need = peak
+    if vfree is not None and vfree < need and not a.no_restart:
+        log(f"[imggen] 仍只有 {vfree:.1f}GB，重启服务…")
+        ensure_service(force=True)
+        restarted = True
+        time.sleep(2)
+        vfree = vfree_gb()
+    if vfree is not None and vfree < need:
+        lock.close()
+        fail(4, "low_vram",
+             f"空闲显存 {vfree:.1f}GB 仍低于 {a.model} 需要的 {need:.1f}GB",
+             "有其他进程占用显存（rocm-smi 查看），或等它们结束")
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        open(state_path, "w").write(a.model)
+    except Exception:
+        pass
+
+    touch_activity()
+    t0 = time.time()
+    res = submit(graph)
+    pid = res.get("prompt_id")
+    if not pid:
+        fail(5, "no_prompt_id", f"提交返回异常：{json.dumps(res)[:500]}")
+    log(f"[imggen] 已提交 {pid}（{a.model}/{preset}，seed={a.seed}）")
+
+    entry, _ = wait_done(pid, a.timeout)
+    touch_activity()
+    elapsed = round(time.time() - t0, 1)
+
+    err = entry_error(entry)
+    if err:
+        kind, node_type, detail = err
+        lock.close()
+        fail(6, "execution_failed", f"{kind} @ {node_type}: {detail}",
+             f"查看 {LOG} 尾部日志")
+
+    paths = collect_images(entry)
+    if not paths:
+        lock.close()
+        fail(6, "no_output", "执行完成但没有找到输出图片",
+             "加 --dry 检查 SaveImage 节点")
+
+    warnings = []
+    est = MODELS[a.model]["presets"].get(preset, {}).get("est_seconds")
+    # 冷启动判定：实测明显超出热态基准，或提交前显存里几乎没有模型
+    cold_likely = bool(est and elapsed > est * 1.3) or (est is None and elapsed > 20)
+    if started:
+        warnings.append("auto_started_service")
+    if freed:
+        warnings.append("unloaded_models_before_run")
+    if restarted:
+        warnings.append("restarted_service_for_memory")
+    if cold_likely:
+        warnings.append("cold_start（模型未驻留或刚换模型，本次耗时偏高）")
+    if a.lora:
+        warnings.append("lora_on_quantized_model（量化权重上的 LoRA 效果需目视确认）")
+    if preset.startswith("custom"):
+        warnings.append("custom_size_single_pass")
+
+    try:
+        st = system_stats()
+        vram_after = round((st["vram_total"] - st["vram_free"]) / GB, 2)
+    except Exception:
+        vram_after = None
+
+    emit({
+        "ok": True,
+        "model": a.model,
+        "preset": preset,
+        "width": spec["width"],
+        "height": spec["height"],
+        "output_width": int(spec["width"] * spec.get("scale", 1)),
+        "output_height": int(spec["height"] * spec.get("scale", 1)),
+        "steps": spec["steps"],
+        "steps2": spec.get("steps2"),
+        "seed": a.seed,
+        "images": paths,
+        "seconds": elapsed,
+        "estimated_seconds_hot": MODELS[a.model]["presets"].get(preset, {}).get("est_seconds"),
+        "cold_likely": cold_likely,
+        "restarted": restarted,
+        "vram_used_gb": vram_after,
+        "extra_prompt_id": pid,
+        "warnings": warnings,
+    })
+    lock.close()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        fail(6, "interrupted", "被用户中断")
+    except SystemExit:
+        raise
+    except Exception as e:  # 兜底，保证 stdout 仍是 JSON
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        fail(6, "internal_error", f"{type(e).__name__}: {e}")
