@@ -159,7 +159,15 @@ DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
 # 输出 / 错误
 # ----------------------------------------------------------------------------
 def emit(obj):
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        # 调用方提前关闭管道（例如 | head）时安静退出，不要吐 traceback
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        os._exit(0)
 
 
 def fail(code, err, message, hint=None, **extra):
