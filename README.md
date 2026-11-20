@@ -69,6 +69,8 @@ imggen -m moss --lora ba "anime-style street at night"   # alias -> 0.8
 imggen -m moss --variant sft-int4 "a green apple"        # swap the weight file
 imggen -m moss --steps 35 --cfg 3 --negative "worst quality, bad anatomy" "1girl, ..."
 imggen --edit input.png "turn the sword into a glowing blue blade"   # MOSS edit
+imggen -m krea2 --inpaint out.png --rect 600,500,400,450 "sharper face"  # local refine
+imggen -m krea2 --inpaint out.png --mask mask.png "detailed eyes"        # white = redraw
 imggen --dry -m krea2 "x"            # print the API graph without submitting
 ```
 
@@ -383,6 +385,43 @@ prompt guides every step at full resolution instead of refining an upscaled
 720×1280 latent, so fine detail is better and the layout is not locked in by
 the first pass. It costs more sampling time than `2k`: use `2k` when you want
 a predictable composition, `2k-direct` when detail matters more.
+
+### Local refine (`--inpaint`)
+
+`--inpaint` redraws one region of an existing image and leaves the rest alone.
+It is a detailer, not a fill model: the region is cropped with context, enlarged
+to a comfortable working resolution, sampled at a low denoise, then composited
+back through a feathered mask.
+
+```bash
+imggen -m krea2 --inpaint out.png --rect 600,500,400,450 "detailed face"
+imggen -m krea2 --inpaint out.png --mask mask.png "detailed face"
+imggen -m krea2 --inpaint out.png --rect ... --refine-denoise 0.20 --no-refine-sr ...
+```
+
+Krea 2 has no inpaint weights, so this is the training-free route the community
+uses: `SetLatentNoiseMask` restricts sampling to the mask, which keeps everything
+outside it anchored to the source. The composite mask is feathered separately,
+so the seam is blended instead of cut.
+
+What the defaults mean:
+
+- `--rect X,Y,W,H` in source pixels, or `--mask` with white = redraw. Both
+  produce the same crop; the mask version keeps a hand-drawn shape.
+- `--refine-pad 64` adds context around the region. Without context the model
+  has no idea what the crop belongs to.
+- `--refine-long-edge 1024` sets the generation size. Krea 2 is trained at
+  ≤2 MP, so a 300 px face does not get more detail from a 2K canvas.
+- `--no-refine-sr` skips the AnimeSharp 2× pre-upscale. Keep it on: the SR
+  input is sharper, so the sampler has to invent less and the face moves less.
+- `--refine-denoise 0.12` is the safe value. Measured on a 1536² anime portrait:
+  0.12 changes almost nothing, 0.15 slightly enlarges the eyes, 0.30 visibly
+  restages the face. Raise it only when you actually want new content in the
+  region (0.5+ for background replacement).
+
+Measured 17 s warm, 24 s cold, on the same 16 GB card. This refines detail; it
+does not invent missing structure. If the source face is already soft from a
+latent upscale, refine the 720p pass and then run the pixel two-pass.
 
 ## Safety
 

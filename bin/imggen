@@ -448,12 +448,8 @@ def acquire_lock(max_wait):
 # ----------------------------------------------------------------------------
 # 节点图构造（API 格式）
 # ----------------------------------------------------------------------------
-def build_graph(a, spec, prompt_text, edit_image):
-    g = {}
-
-    def add(nid, ctype, inputs):
-        g[str(nid)] = {"class_type": ctype, "inputs": inputs}
-
+def _add_model_chain(add, a, spec, edit_image):
+    """UNET -> LoRA 链 -> RDNA2Attention，返回模型引用。"""
     add(1, "UNETLoader", {"unet_name": a.mcfg["unet"],
                           "weight_dtype": "default"})
     model_ref = ["1", 0]
@@ -475,9 +471,17 @@ def build_graph(a, spec, prompt_text, edit_image):
             {"model": model_ref, "lora_name": name, "strength_model": strength})
         model_ref = [str(nid), 0]
 
-    accel = a.mcfg["accel"]
-    add(20, "RDNA2Attention", {"model": model_ref, **accel})
-    model_ref = ["20", 0]
+    add(20, "RDNA2Attention", {"model": model_ref, **a.mcfg["accel"]})
+    return ["20", 0]
+
+
+def build_graph(a, spec, prompt_text, edit_image):
+    g = {}
+
+    def add(nid, ctype, inputs):
+        g[str(nid)] = {"class_type": ctype, "inputs": inputs}
+
+    model_ref = _add_model_chain(add, a, spec, edit_image)
 
     add(3, "CLIPLoader", dict(a.mcfg["clip"]))
     add(4, "VAELoader", {"vae_name": spec.get("vae") or a.mcfg["vae"]})
@@ -572,6 +576,70 @@ def build_graph(a, spec, prompt_text, edit_image):
     return g
 
 
+def build_refine_graph(a, spec, prompt_text, src_name, mask_name, crop):
+    """局部细化：crop -> 可选 SR 放大 -> mask 内低 denoise 采样 -> 羽化贴回。
+
+    mask 外的像素由 SetLatentNoiseMask 锁死，贴回时再用羽化 mask 混合边界，
+    所以周围内容不会被重画。
+    """
+    g = {}
+
+    def add(nid, ctype, inputs):
+        g[str(nid)] = {"class_type": ctype, "inputs": inputs}
+
+    model_ref = _add_model_chain(add, a, spec, False)
+
+    add(3, "CLIPLoader", dict(a.mcfg["clip"]))
+    add(4, "VAELoader", {"vae_name": spec["vae"]})
+    add(5, "CLIPTextEncode", {"text": prompt_text, "clip": ["3", 0]})
+    add(6, "ConditioningZeroOut", {"conditioning": ["5", 0]})
+    add(19, "ForceUnloadModels",
+        {"model": model_ref, "positive": ["5", 0], "negative": ["6", 0]})
+
+    cx, cy, cw, ch, tw, th = crop
+    add(50, "LoadImage", {"image": src_name, "upload": "image"})
+    add(51, "LoadImageMask", {"image": mask_name, "channel": "red"})
+
+    # crop 出重绘区域（含上下文）和对应的 mask
+    add(52, "MaskToImage", {"mask": ["51", 0]})
+    add(53, "ImageCrop", {"image": ["52", 0], "width": cw, "height": ch,
+                          "x": cx, "y": cy})
+    add(54, "ImageToMask", {"image": ["53", 0], "channel": "red"})
+    add(55, "FeatherMask", {"mask": ["54", 0], "left": a.refine_feather,
+                            "top": a.refine_feather, "right": a.refine_feather,
+                            "bottom": a.refine_feather})
+    add(56, "ImageCrop", {"image": ["50", 0], "width": cw, "height": ch,
+                          "x": cx, "y": cy})
+
+    gen = ["56", 0]
+    if not a.no_refine_sr:
+        add(60, "UpscaleModelLoader", {"model_name": a.refine_sr_model})
+        add(61, "ImageUpscaleWithModel", {"upscale_model": ["60", 0],
+                                          "image": ["56", 0]})
+        gen = ["61", 0]
+    add(62, "ImageScale", {"image": gen, "upscale_method": "lanczos",
+                           "width": tw, "height": th, "crop": "disabled"})
+
+    add(63, "VAEEncode", {"pixels": ["62", 0], "vae": ["4", 0]})
+    add(64, "SetLatentNoiseMask", {"samples": ["63", 0], "mask": ["54", 0]})
+    add(65, "KSampler", {"model": ["19", 0], "seed": a.seed,
+                         "steps": spec["steps"], "cfg": spec["cfg"],
+                         "sampler_name": spec["sampler"],
+                         "scheduler": spec["scheduler"],
+                         "positive": ["5", 0], "negative": ["6", 0],
+                         "latent_image": ["64", 0], "denoise": spec["denoise"]})
+    add(66, "VAEDecodeTiled", {"samples": ["65", 0], "vae": ["4", 0],
+                               "tile_size": 512, "overlap": 64,
+                               "temporal_size": 64, "temporal_overlap": 8})
+    add(67, "ImageScale", {"image": ["66", 0], "upscale_method": "lanczos",
+                           "width": cw, "height": ch, "crop": "disabled"})
+    add(68, "ImageCompositeMasked", {"destination": ["50", 0],
+                                     "source": ["67", 0], "x": cx, "y": cy,
+                                     "resize_source": False, "mask": ["55", 0]})
+    add(69, "SaveImage", {"images": ["68", 0], "filename_prefix": a.out})
+    return g
+
+
 # ----------------------------------------------------------------------------
 # 尺寸 / 参数
 # ----------------------------------------------------------------------------
@@ -651,6 +719,88 @@ def resolve_variant(a):
     _merge_variant(cfg, variants[name])
     cfg["variant"] = name
     return cfg
+
+
+def refine_spec(a):
+    steps = a.steps or a.mcfg.get("custom_steps", 8)
+    return dict(width=0, height=0, steps=steps,
+                cfg=1.0 if a.cfg is None else a.cfg,
+                sampler="euler", scheduler="simple",
+                denoise=0.12 if a.refine_denoise is None else a.refine_denoise,
+                vae=a.vae or a.mcfg["vae"], vae_tiled=True)
+
+
+def _copy_image(path, prefix):
+    """把本地图片复制进 ComfyUI/input，按内容哈希去重。"""
+    src = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(src):
+        fail(2, "file_not_found", f"图片不存在：{src}")
+    ext = os.path.splitext(src)[1].lower() or ".png"
+    if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+        fail(2, "bad_image", f"不支持的图片格式：{ext}")
+    h = hashlib.sha1(open(src, "rb").read()).hexdigest()[:12]
+    name = f"{prefix}_{h}{ext}"
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    dst = os.path.join(INPUT_DIR, name)
+    if not os.path.exists(dst):
+        shutil.copyfile(src, dst)
+    return name, src
+
+
+def prepare_refine(a):
+    """读源图/区域，算 crop 计划，并把 mask 写进 input。返回 (源图名, mask名, crop)。"""
+    from PIL import Image, ImageDraw
+
+    src_name, src = _copy_image(a.inpaint, "imggen_inpaint")
+    im = Image.open(src)
+    W, H = im.size
+
+    if a.rect:
+        m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*",
+                         a.rect)
+        if not m:
+            fail(2, "bad_rect", f"--rect 需要 X,Y,W,H，收到 {a.rect!r}",
+                 "例：--rect 600,500,400,450")
+        x, y, w, h = (int(v) for v in m.groups())
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > W or y + h > H:
+            fail(2, "bad_rect",
+                 f"--rect {a.rect} 超出图片范围 {W}x{H}",
+                 f"x+w ≤ {W}，y+h ≤ {H}")
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rectangle((x, y, x + w - 1, y + h - 1), fill=255)
+    else:
+        mask_name_in, mask_path = _copy_image(a.mask, "imggen_mask_in")
+        mask = Image.open(mask_path).convert("L")
+        if mask.size != (W, H):
+            fail(2, "mask_size_mismatch",
+                 f"mask {mask.size[0]}x{mask.size[1]} 与源图 {W}x{H} 不一致",
+                 "mask 按原图像素坐标绘制，不需要缩放")
+        bbox = mask.point(lambda v: 255 if v > 127 else 0).getbbox()
+        if not bbox:
+            fail(2, "empty_mask", "mask 全黑，没有可重绘的区域",
+                 "白色（>127）才是重绘区域")
+        x, y, w, h = bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    pad = max(0, a.refine_pad)
+    cx, cy = max(0, x - pad), max(0, y - pad)
+    cw = min(W - cx, w + 2 * pad)
+    ch = min(H - cy, h + 2 * pad)
+    cw -= cw % 8
+    ch -= ch % 8
+    if cw < 64 or ch < 64:
+        fail(2, "region_too_small", f"重绘区域只有 {cw}x{ch}，最小 64x64")
+
+    long_edge = max(64, a.refine_long_edge)
+    scale = long_edge / max(cw, ch)
+    tw = max(64, int(round(cw * scale / 16)) * 16)
+    th = max(64, int(round(ch * scale / 16)) * 16)
+
+    key = hashlib.sha1(f"{W}x{H}|{cx},{cy},{cw},{ch}".encode()).hexdigest()[:12]
+    mask_name = f"imggen_refine_mask_{key}.png"
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    mask.convert("RGB").save(os.path.join(INPUT_DIR, mask_name))
+
+    return src_name, mask_name, (cx, cy, cw, ch, tw, th), (W, H)
 
 
 def resolve_spec(a):
@@ -949,6 +1099,8 @@ def do_list():
             'imggen -m moss --steps 35 --cfg 3 --negative "worst quality" "提示词"',
             'imggen -m moss --allow-format-mismatch --prompt "1girl, solo"',
             'imggen --edit 图片路径 "编辑指令"',
+            'imggen -m krea2 --inpaint 成片.png --rect 600,500,400,450 "描述"',
+            'imggen -m krea2 --inpaint 成片.png --mask mask.png "描述"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
                        "4": "内存不足", "5": "提交被拒", "6": "执行失败或超时"},
@@ -998,6 +1150,23 @@ def build_parser():
                     help="未写强度时的默认 LoRA 强度")
     ap.add_argument("--edit", metavar="IMAGE", help="MOSS 参考图编辑的输入图片")
     ap.add_argument("--edit-strength", type=float, default=1.0)
+    ap.add_argument("--inpaint", metavar="IMAGE",
+                    help="局部细化/重绘的源图；配合 --rect 或 --mask 指定区域")
+    ap.add_argument("--rect", metavar="X,Y,W,H",
+                    help="重绘区域（原图像素坐标），与 --mask 互斥")
+    ap.add_argument("--mask", metavar="IMAGE",
+                    help="黑白 mask 图，白=重绘；与 --rect 互斥")
+    ap.add_argument("--refine-denoise", type=float,
+                    help="局部重绘 denoise，默认 0.12（0.15 起会轻微改动五官）")
+    ap.add_argument("--refine-pad", type=int, default=64,
+                    help="crop 时保留的上下文像素，默认 64")
+    ap.add_argument("--refine-long-edge", type=int, default=1024,
+                    help="重绘区域的长边分辨率，默认 1024")
+    ap.add_argument("--refine-feather", type=int, default=32,
+                    help="贴回时的羽化像素，默认 32")
+    ap.add_argument("--no-refine-sr", action="store_true",
+                    help="不用 AnimeSharp 放大 crop（默认用，线条更稳）")
+    ap.add_argument("--refine-sr-model", default="2x-AnimeSharpV2_RPLKSR_Sharp.pth")
     ap.add_argument("--out", help="SaveImage 文件名前缀")
     ap.add_argument("--timeout", type=int, default=900)
     ap.add_argument("--queue-wait", type=int, default=600)
@@ -1048,6 +1217,17 @@ def main():
         fail(2, "bad_edit_model", "--edit 只有 moss 支持",
              "imggen -m moss --edit 图片路径 \"指令\"")
 
+    if a.inpaint and a.edit:
+        fail(2, "bad_args", "--inpaint 与 --edit 不能同时使用",
+             "--inpaint 是局部重绘，--edit 是整图指令编辑")
+    if a.inpaint:
+        if a.rect and a.mask:
+            fail(2, "bad_args", "--rect 与 --mask 只能二选一",
+                 "--rect 给矩形，--mask 给任意形状的 mask 图")
+        if not a.rect and not a.mask:
+            fail(2, "bad_args", "--inpaint 需要 --rect 或 --mask 指定重绘区域",
+                 '例：--inpaint out.png --rect 600,500,400,450 "..."')
+
     # seed
     if str(a.seed).lower() in ("random", "rand", "r"):
         a.seed = random.randrange(0, 2 ** 32)
@@ -1062,7 +1242,11 @@ def main():
         ensure_service()
     a.loras = resolve_loras(a)
 
-    spec, preset, custom = resolve_spec(a)
+    if a.inpaint:
+        spec = refine_spec(a)
+        preset, custom = "refine", True
+    else:
+        spec, preset, custom = resolve_spec(a)
     if a.vae:
         spec["vae"] = a.vae
 
@@ -1082,18 +1266,30 @@ def main():
         if not os.path.exists(dst):
             shutil.copyfile(src, dst)
 
+    refine_src = refine_mask = refine_crop = refine_size = None
+    if a.inpaint:
+        refine_src, refine_mask, refine_crop, refine_size = prepare_refine(a)
+
     if not a.out:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         a.out = f"imggen_{a.model}_{ts}"
 
-    graph = build_graph(a, spec, prompt, edit_name)
+    if a.inpaint:
+        graph = build_refine_graph(a, spec, prompt, refine_src, refine_mask,
+                                   refine_crop)
+    else:
+        graph = build_graph(a, spec, prompt, edit_name)
 
     if a.dry:
-        emit({"ok": True, "dry": True, "model": a.model,
-              "variant": a.mcfg.get("variant"), "preset": preset,
-              "prompt_style": prompt_style,
-              "supports_tags": a.mcfg.get("supports_tags", True),
-              "spec": spec, "seed": a.seed, "graph": graph})
+        d = {"ok": True, "dry": True, "model": a.model,
+             "variant": a.mcfg.get("variant"), "preset": preset,
+             "prompt_style": prompt_style,
+             "supports_tags": a.mcfg.get("supports_tags", True),
+             "spec": spec, "seed": a.seed, "graph": graph}
+        if a.inpaint:
+            d["refine"] = {"source": refine_src, "mask": refine_mask,
+                           "crop": refine_crop}
+        emit(d)
         return 0
 
     # 只有真正出图才刷新空闲计时（--list / --dry / 参数错误都不算请求）
@@ -1250,10 +1446,12 @@ def main():
         "supports_tags": a.mcfg.get("supports_tags", True),
         "vae": spec.get("vae") or a.mcfg["vae"],
         "preset": preset,
-        "width": spec["width"],
-        "height": spec["height"],
-        "output_width": int(spec["width"] * spec.get("scale", 1)),
-        "output_height": int(spec["height"] * spec.get("scale", 1)),
+        "width": refine_size[0] if refine_size else spec["width"],
+        "height": refine_size[1] if refine_size else spec["height"],
+        "output_width": (refine_size[0] if refine_size
+                         else int(spec["width"] * spec.get("scale", 1))),
+        "output_height": (refine_size[1] if refine_size
+                          else int(spec["height"] * spec.get("scale", 1))),
         "steps": spec["steps"],
         "steps2": spec.get("steps2"),
         "seed": a.seed,
@@ -1265,6 +1463,8 @@ def main():
         "vram_used_gb": vram_after,
         "extra_prompt_id": pid,
         "warnings": warnings,
+        **({"refine": {"region": refine_crop, "denoise": spec["denoise"],
+                       "source": refine_src}} if a.inpaint else {}),
     })
     lock.close()
     return 0

@@ -1070,7 +1070,9 @@ def build_imggen_args(a, prompt):
         pass  # source 只用于池元数据
     for name in ("seed", "preset", "variant", "size", "aspect", "width", "height", "steps", "steps2",
                  "cfg", "denoise", "denoise2", "scale", "out", "edit", "negative",
-                 "lora_strength", "edit_strength", "queue_wait", "lock_wait"):
+                 "lora_strength", "edit_strength", "queue_wait", "lock_wait",
+                 "inpaint", "rect", "mask", "refine_denoise", "refine_pad",
+                 "refine_long_edge", "refine_feather", "refine_sr_model"):
         v = getattr(a, name, None)
         if v is None:
             continue
@@ -1079,7 +1081,8 @@ def build_imggen_args(a, prompt):
     for name in ("lora",):
         for v in getattr(a, name, []) or []:
             args += ["--" + name, v]
-    for name in ("allow_risky", "no_restart", "allow_format_mismatch", "latent"):
+    for name in ("allow_risky", "no_restart", "allow_format_mismatch", "latent",
+                 "no_refine_sr"):
         if getattr(a, name, False):
             args.append("--" + name.replace("_", "-"))
     if a.prompt_file:
@@ -1407,6 +1410,15 @@ def build_parser():
     p.add_argument("--lora-strength", type=float)
     p.add_argument("--edit")
     p.add_argument("--edit-strength", type=float)
+    p.add_argument("--inpaint", help="局部重绘源图")
+    p.add_argument("--rect", help="重绘矩形 X,Y,W,H")
+    p.add_argument("--mask", help="黑白 mask 图（白=重绘）")
+    p.add_argument("--refine-denoise", type=float)
+    p.add_argument("--refine-pad", type=int)
+    p.add_argument("--refine-long-edge", type=int)
+    p.add_argument("--refine-feather", type=int)
+    p.add_argument("--refine-sr-model")
+    p.add_argument("--no-refine-sr", action="store_true")
     p.add_argument("--out")
     p.add_argument("--allow-risky", action="store_true")
     p.add_argument("--allow-format-mismatch", action="store_true")
