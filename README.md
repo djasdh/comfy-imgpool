@@ -333,6 +333,15 @@ and PSNR against the full VAE decode is ~39.9 dB. Text rendering suffers from
 any second pass (`denoise2 > 0` repaints glyphs), so use single-pass 1024 for
 text-heavy prompts.
 
+### Krea 2 two-pass
+
+`krea2 --preset 2k` renders 720×1280 first, then a 1.6× latent upscale
+(1152×2048) with `steps2 8, denoise2 0.15`. Higher denoise repaints the face
+and breaks the eyes on the 8-step turbo weights. The decode uses
+`VAEDecodeTiled`: the Qwen Image VAE reserves ~4 GB for a full-frame 2K decode,
+which does not fit next to the resident 12B UNET, and tiling costs almost
+nothing on this VAE. `--scale 1.5` (1080×1920) is the fallback if VRAM is tight.
+
 ## Safety
 
 - Both tools bind only to `127.0.0.1` by default. `IMGPOOL_BIND` can expose one

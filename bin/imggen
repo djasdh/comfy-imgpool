@@ -207,8 +207,8 @@ MODELS = {
         "presets": {
             "2k": dict(width=720, height=1280, steps=8, cfg=1.0,
                        sampler="euler", scheduler="simple", denoise=1.0,
-                       two_pass=True, scale=1.6, steps2=4, denoise2=0.25,
-                       est_seconds=27.2),
+                       two_pass=True, scale=1.6, steps2=8, denoise2=0.15,
+                       vae_tiled=True, est_seconds=27.2),
             "720p": dict(width=720, height=1280, steps=8, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=10.1),
@@ -482,7 +482,14 @@ def build_graph(a, spec, prompt_text, edit_image):
         })
         last = ["10", 0]
 
-    add(11, "VAEDecode", {"samples": last, "vae": ["4", 0]})
+    if spec.get("vae_tiled"):
+        add(11, "VAEDecodeTiled", {
+            "samples": last, "vae": ["4", 0],
+            "tile_size": spec.get("vae_tile_size", 512), "overlap": 64,
+            "temporal_size": 64, "temporal_overlap": 8,
+        })
+    else:
+        add(11, "VAEDecode", {"samples": last, "vae": ["4", 0]})
     add(12, "SaveImage", {"images": ["11", 0], "filename_prefix": a.out})
     return g
 
