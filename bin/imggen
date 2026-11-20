@@ -224,6 +224,8 @@ DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
 LORA_ALIASES = {
     "ba": ("ba_style_moss_v09.safetensors", 0.8),
     "zzz": ("zzz_anireal_moss_v1.safetensors", 1.5),
+    "ba2": ("BArtstyle-KREA2-V2-1024.safetensors", 0.8),
+    "thick": ("krea2_style_magful.safetensors", 1.0),
 }
 LORA_DEFAULTS = {v[0]: v[1] for v in LORA_ALIASES.values()}
 
@@ -509,10 +511,15 @@ def detect_prompt_style(text):
               for p in parts]
     avg = sum(counts) / len(counts)
     long_parts = sum(1 for c in counts if c > 10)
-    if (len(parts) >= 4 and avg <= 5 and sentences == 0
-            and long_parts <= len(parts) // 5):
+    # 自然语言里冠词/介词/连词密度高；tag 基本只有名词和形容词
+    markers = len(re.findall(
+        r"\b(a|an|the|of|with|in|on|at|wearing|standing|looking|while|"
+        r"and|but|from|into|under|over|his|her|their|is|are|was)\b",
+        s, re.I))
+    if (len(parts) >= 4 and avg <= 3.5 and sentences == 0
+            and long_parts == 0 and markers < 8):
         return "tag"
-    if sentences >= 1 or avg >= 12:
+    if sentences >= 1 or avg >= 6 or markers >= 8:
         return "natural"
     return "mixed"
 
