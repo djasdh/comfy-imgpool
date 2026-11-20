@@ -285,6 +285,23 @@ Presets are deliberately small and explicit rather than clever: a preset name ma
 default_strength)`, so `--lora ba` expands to `ba_style_moss_v09:0.8`.
 Edit it to match the LoRAs on your machine.
 
+## Prompt format
+
+`imggen` classifies the prompt lexically as `tag`, `natural` or `mixed`
+(quoted in-image text is ignored). A `tag` prompt sent to a model with
+`supports_tags: false` is rejected with exit code 2:
+
+```json
+{"ok": false, "error": "prompt_format_unsupported",
+ "message": "moss 不支持 tag 形态的提示词（检测为 tag）",
+ "hint": "改写成自然语言描述，或加 --allow-format-mismatch 强制发送"}
+```
+
+MOSS is `supports_tags: false` because its official recipe is natural
+language. The escape hatch is `--allow-format-mismatch`; the result then
+carries a `format_mismatch_forced` warning. Both `imggen` and `imgpool
+submit` accept it.
+
 ## Safety
 
 - Both tools bind only to `127.0.0.1` by default. `IMGPOOL_BIND` can expose one

@@ -1079,7 +1079,7 @@ def build_imggen_args(a, prompt):
     for name in ("lora",):
         for v in getattr(a, name, []) or []:
             args += ["--" + name, v]
-    for name in ("allow_risky", "no_restart"):
+    for name in ("allow_risky", "no_restart", "allow_format_mismatch"):
         if getattr(a, name, False):
             args.append("--" + name.replace("_", "-"))
     if a.prompt_file:
@@ -1407,6 +1407,7 @@ def build_parser():
     p.add_argument("--edit-strength", type=float)
     p.add_argument("--out")
     p.add_argument("--allow-risky", action="store_true")
+    p.add_argument("--allow-format-mismatch", action="store_true")
     p.add_argument("--no-restart", action="store_true")
     p.add_argument("--queue-wait", type=int)
     p.add_argument("--lock-wait", type=int)

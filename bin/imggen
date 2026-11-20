@@ -76,6 +76,7 @@ GB = 1024 ** 3
 MODELS = {
     "moss": {
         "display": "MOSS Image SFT int8（Flux2 VAE）",
+        "supports_tags": False,  # 官方默认自然语言；tag 需 --allow-format-mismatch
         "unet": "moss_image_sft_int8_convrot.safetensors",
         "default_variant": "sft-int8",
         "variants": {
@@ -125,6 +126,7 @@ MODELS = {
     },
     "anima": {
         "display": "Anima Turbo V10 int8 convrot（Qwen Image VAE）",
+        "supports_tags": True,
         "unet": "anima_turboV10_int8_convrot.safetensors",
         "default_variant": "turbo-int8",
         "variants": {
@@ -170,6 +172,7 @@ MODELS = {
     },
     "krea2": {
         "display": "Krea2 Turbo int4 convrot（Qwen Image VAE）",
+        "supports_tags": True,
         "unet": "krea2_turbo-int4_convrot.safetensors",
         "default_variant": "int4",
         "variants": {
@@ -479,6 +482,31 @@ def round64(v):
     return max(64, int(round(v / 64.0)) * 64)
 
 
+def detect_prompt_style(text):
+    """词法判断提示词形态：tag / natural / mixed。
+
+    只做标注，不改写提示词。引号内的画面文字（文字渲染）不参与判断。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "empty"
+    s = re.sub(r'"[^"]*"|“[^”]*”|「[^」]*」', " ", t)
+    parts = [p.strip() for p in re.split(r"[,，\n]+", s) if p.strip()]
+    if not parts:
+        return "natural"
+    sentences = len(re.findall(r"[.!?。！？]", s))
+    counts = [len(re.findall(r"[A-Za-z0-9']+|[\u4e00-\u9fff]", p))
+              for p in parts]
+    avg = sum(counts) / len(counts)
+    long_parts = sum(1 for c in counts if c > 10)
+    if (len(parts) >= 4 and avg <= 5 and sentences == 0
+            and long_parts <= len(parts) // 5):
+        return "tag"
+    if sentences >= 1 or avg >= 12:
+        return "natural"
+    return "mixed"
+
+
 def _merge_variant(dst, src):
     for k, v in src.items():
         if isinstance(v, dict) and isinstance(dst.get(k), dict):
@@ -726,6 +754,7 @@ def do_list():
             "min_free_vram_gb": cfg["vram_need_gb"],
             "supports_edit": name == "moss",
             "default_lora": cfg.get("default_lora"),
+            "supports_tags": cfg.get("supports_tags", True),
             "default_variant": cfg.get("default_variant"),
             "variants": [
                 {
@@ -764,6 +793,7 @@ def do_list():
             'imggen -m moss --lora ba "二次元场景"',
             'imggen -m moss --variant sft-int4 "提示词"',
             'imggen -m moss --steps 35 --cfg 3 --negative "worst quality" "提示词"',
+            'imggen -m moss --allow-format-mismatch --prompt "1girl, solo"',
             'imggen --edit 图片路径 "编辑指令"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
@@ -814,6 +844,8 @@ def build_parser():
                     help="内存不足时不自动重启服务，直接失败")
     ap.add_argument("--allow-risky", action="store_true",
                     help="允许未验证的高分辨率预设")
+    ap.add_argument("--allow-format-mismatch", action="store_true",
+                    help="模型不支持该提示词形态时仍然发送（逃生通道）")
     ap.add_argument("--dry", action="store_true", help="只打印 API graph")
     ap.add_argument("--list", action="store_true", help="输出 JSON 能力清单")
     return ap
@@ -832,12 +864,19 @@ def main():
     if a.negative_file:
         a.negative = open(a.negative_file, encoding="utf-8").read()
     a.negative = (a.negative or "").strip() or None
+    prompt_style = detect_prompt_style(prompt)
 
     if a.model not in MODELS:
         fail(2, "bad_model", f"未知模型 {a.model!r}",
              "可选：" + ", ".join(sorted(MODELS)))
 
     a.mcfg = resolve_variant(a)
+
+    if (prompt_style == "tag" and not a.mcfg.get("supports_tags", True)
+            and not a.allow_format_mismatch):
+        fail(2, "prompt_format_unsupported",
+             f"{a.model} 不支持 tag 形态的提示词（检测为 tag）",
+             "改写成自然语言描述，或加 --allow-format-mismatch 强制发送")
 
     if not prompt or not prompt.strip():
         fail(2, "missing_prompt", "没有提示词",
@@ -888,6 +927,8 @@ def main():
     if a.dry:
         emit({"ok": True, "dry": True, "model": a.model,
               "variant": a.mcfg.get("variant"), "preset": preset,
+              "prompt_style": prompt_style,
+              "supports_tags": a.mcfg.get("supports_tags", True),
               "spec": spec, "seed": a.seed, "graph": graph})
         return 0
 
@@ -1028,6 +1069,8 @@ def main():
         warnings.append("custom_size_single_pass")
     if a.negative and spec["cfg"] <= 1.0:
         warnings.append("negative_ignored_cfg1（cfg=1 不跑负面分支）")
+    if prompt_style == "tag" and not a.mcfg.get("supports_tags", True):
+        warnings.append("format_mismatch_forced（已用逃生通道发送 tag）")
 
     try:
         st = system_stats()
@@ -1039,6 +1082,8 @@ def main():
         "ok": True,
         "model": a.model,
         "variant": a.mcfg.get("variant"),
+        "prompt_style": prompt_style,
+        "supports_tags": a.mcfg.get("supports_tags", True),
         "preset": preset,
         "width": spec["width"],
         "height": spec["height"],
