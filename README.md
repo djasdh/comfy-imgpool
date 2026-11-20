@@ -60,6 +60,7 @@ imggen --list                        # JSON capability list: models, presets, ti
 imggen "a red apple on a wooden table"
 imggen -m anima "anime girl in a sunflower field"
 imggen -m krea2 --preset 2k "cinematic swordswoman"
+imggen -m krea2 --preset 2k --aspect 1:1 "cinematic swordswoman"  # square 1536x1536
 imggen -m krea2 --preset 2k --latent "photoreal portrait"   # latent upscale (old path)
 imggen -m krea2 --preset 2k-direct "cinematic swordswoman"  # single-pass 2K
 imggen -m anima --size 1344x768 "wide cyberpunk street"
@@ -368,6 +369,14 @@ The bundled SR model is **CC-BY-NC-SA 4.0** (non-commercial, share-alike). For
 commercial output, change `upscale_model` in the preset to a permissively
 licensed upscaler (and re-check the numbers — a 4× model also works but the
 2880×5120 intermediate costs ~50 s extra).
+
+`--aspect W:H` picks the composition instead of using the preset's shape, and
+the two-pass output keeps that ratio. It preserves the preset's pixel area and
+rounds the first pass to a multiple of 80 — the least common multiple of the
+16-pixel tile alignment and 5, which is what makes `scale 1.6` land on whole
+8-pixel output dimensions. So `1:1` becomes 960×960 → 1536×1536, `16:9` becomes
+1280×720 → 2048×1152, `4:5` becomes 880×1120 → 1408×1792. Combinations whose
+output is not a multiple of 8 are rejected up front (the 1.4× VAE trap).
 
 `krea2 --preset 2k-direct` samples 1152×2048 in a single pass at 8 steps. The
 prompt guides every step at full resolution instead of refining an upscaled

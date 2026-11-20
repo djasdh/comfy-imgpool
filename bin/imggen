@@ -25,6 +25,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -694,6 +695,32 @@ def resolve_spec(a):
         avail = sorted(list(cfg["presets"]) + list(cfg.get("risky_presets", {})))
         fail(2, "bad_preset", f"{a.model} 没有预设 {preset!r}", f"可选：{', '.join(avail)}")
 
+    # --aspect：按比例重算首采尺寸。80 对齐 = LCM(16 像素对齐, 5)，
+    # 这样 scale 取 1.5/1.6/2.0 时二采输出一定是 8 的倍数（避免 1.4x 那种 VAE 慢速坑）。
+    if a.aspect:
+        if a.size:
+            fail(2, "bad_args", "--aspect 与 --size 不能同时使用",
+                 "--size 直接给尺寸，--aspect 只给比例")
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)", a.aspect.strip())
+        if not m:
+            fail(2, "bad_aspect", f"--aspect 需要 W:H 格式，收到 {a.aspect!r}",
+                 "例：--aspect 1:1 / 16:9 / 9:16 / 4:5 / 3:2")
+        ra, rb = float(m.group(1)), float(m.group(2))
+        if ra <= 0 or rb <= 0:
+            fail(2, "bad_aspect", f"--aspect 的宽高必须大于 0：{a.aspect!r}")
+        area = spec["width"] * spec["height"]
+        w = max(480, int(round(math.sqrt(area * ra / rb) / 80.0)) * 80)
+        h = max(480, int(round(w * rb / ra / 80.0)) * 80)
+        spec["width"], spec["height"] = w, h
+        if spec.get("two_pass"):
+            ow, oh = w * spec["scale"], h * spec["scale"]
+            if (abs(ow - round(ow)) > 1e-6 or abs(oh - round(oh)) > 1e-6
+                    or int(round(ow)) % 8 or int(round(oh)) % 8):
+                fail(2, "bad_aspect_scale",
+                     f"{a.aspect} × scale {spec['scale']:g} 的输出 {ow:g}x{oh:g} "
+                     f"不是整数或不是 8 的倍数",
+                     "换 scale（1.5 / 1.6 / 2.0）或换比例")
+
     # --latent：二采回退到 latent 放大（krea2 的 2k 默认是像素放大链路）
     if spec.get("two_pass") and a.latent and spec.get("upscale_mode") == "pixel":
         spec["upscale_mode"] = "latent"
@@ -948,6 +975,9 @@ def build_parser():
     ap.add_argument("--preset", help="预设名，见 --list")
     ap.add_argument("--size", help="自定义尺寸 WxH（走单采，必须 64 对齐）")
     ap.add_argument("--width", type=int)
+    ap.add_argument("--aspect", metavar="W:H",
+                    help="按长宽比选尺寸（如 1:1 / 16:9 / 9:16 / 4:5）；"
+                         "首采按原预设面积换算，二采按同一比例放大")
     ap.add_argument("--height", type=int)
     ap.add_argument("--seed", default="424242", help="整数或 random")
     ap.add_argument("--steps", type=int, help="覆盖首采步数")

@@ -1068,7 +1068,7 @@ def build_imggen_args(a, prompt):
         args.append(prompt)
     if a.source:
         pass  # source 只用于池元数据
-    for name in ("seed", "preset", "variant", "size", "width", "height", "steps", "steps2",
+    for name in ("seed", "preset", "variant", "size", "aspect", "width", "height", "steps", "steps2",
                  "cfg", "denoise", "denoise2", "scale", "out", "edit", "negative",
                  "lora_strength", "edit_strength", "queue_wait", "lock_wait"):
         v = getattr(a, name, None)
@@ -1391,6 +1391,8 @@ def build_parser():
     p.add_argument("--preset")
     p.add_argument("--variant", help="权重变体，见 imggen --list")
     p.add_argument("--size")
+    p.add_argument("--aspect", metavar="W:H",
+                   help="按长宽比选尺寸（1:1 / 16:9 / 9:16 / 4:5），二采同比例放大")
     p.add_argument("--width", type=int)
     p.add_argument("--height", type=int)
     p.add_argument("--steps", type=int)
