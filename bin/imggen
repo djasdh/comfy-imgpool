@@ -122,16 +122,16 @@ MODELS = {
                          sampler="euler", scheduler="simple", denoise=1.0,
                          two_pass=True, scale=1.25, steps2=4, denoise2=0.2,
                          vae="taef2", est_seconds=None),
+            # 二采：1024 首采 -> 1536（1.5×，TAEF2 解码，冷启动约 40s）
+            "1536-2pass": dict(width=1024, height=1024, steps=4, cfg=1.0,
+                               sampler="euler", scheduler="simple", denoise=1.0,
+                               two_pass=True, scale=1.5, steps2=4, denoise2=0.3,
+                               vae="taef2", est_seconds=None),
         },
         "risky_presets": {
             "1536": dict(width=1536, height=1536, steps=4, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=None),
-            # 二采：1024 首采 -> 1536（1.5×，之前跑挂过，需 --allow-risky）
-            "1536-2pass": dict(width=1024, height=1024, steps=4, cfg=1.0,
-                               sampler="euler", scheduler="simple", denoise=1.0,
-                               two_pass=True, scale=1.5, steps2=4, denoise2=0.3,
-                               vae="taef2", est_seconds=None),
         },
     },
     "anima": {
