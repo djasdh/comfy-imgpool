@@ -126,6 +126,24 @@ MODELS = {
     "anima": {
         "display": "Anima Turbo V10 int8 convrot（Qwen Image VAE）",
         "unet": "anima_turboV10_int8_convrot.safetensors",
+        "default_variant": "turbo-int8",
+        "variants": {
+            "turbo-int8": {},
+            "aesthetic": {
+                "display": "Anima Aesthetic v1.1 BF16（Qwen Image VAE）",
+                "unet": "anima-aesthetic-v1.1.safetensors",
+                "accel": {"int8_gemm": False},
+                "vram_need_gb": 7.0,
+                "notes": "BF16 非量化权重，不跑 int8 GEMM；美学微调版。",
+            },
+            "turbo-fp16": {
+                "display": "Anima Turbo v1.0 BF16（Qwen Image VAE）",
+                "unet": "anima-turbo-v1.0.safetensors",
+                "accel": {"int8_gemm": False},
+                "vram_need_gb": 7.0,
+                "notes": "原始 BF16 Turbo，未量化。",
+            },
+        },
         "clip": {"clip_name": "qwen_3_06b_base.safetensors",
                  "type": "stable_diffusion", "device": "default"},
         "vae": "qwen_image_vae.safetensors",
@@ -153,6 +171,17 @@ MODELS = {
     "krea2": {
         "display": "Krea2 Turbo int4 convrot（Qwen Image VAE）",
         "unet": "krea2_turbo-int4_convrot.safetensors",
+        "default_variant": "int4",
+        "variants": {
+            "int4": {},
+            "int8": {
+                "display": "Krea2 Turbo int8 convrot（Qwen Image VAE）",
+                "unet": "krea2_turbo_int8_convrot.safetensors",
+                "min_avail_gb": 10.0,
+                "vram_need_gb": 15.0,
+                "notes": "int8 权重 13GB；2K 二采建议 --steps2 8。",
+            },
+        },
         "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
                  "type": "krea2", "device": "default"},
         "vae": "qwen_image_vae.safetensors",
