@@ -302,6 +302,37 @@ language. The escape hatch is `--allow-format-mismatch`; the result then
 carries a `format_mismatch_forced` warning. Both `imggen` and `imgpool
 submit` accept it.
 
+## MOSS two-pass and TAEF2
+
+MOSS uses the Flux2 VAE, which is huge. Above 1024 the untiled decode no longer
+fits in 16GB, ComfyUI falls back to tiled decode, and a 1280² decode takes
+around 318s (1152² took 603s). The `1280` preset therefore decodes with TAEF2,
+the 10MB MIT-licensed tiny autoencoder from
+[madebyollin/taef2](https://huggingface.co/madebyollin/taef2):
+
+1. Download `taef2.safetensors` into a temp dir.
+2. Convert its diffusers key layout to the TAESD layout ComfyUI expects
+   (encoder offset 0, decoder offset +1):
+
+```python
+from safetensors.torch import load_file, save_file
+sd = load_file("taef2.safetensors")
+enc, dec = {}, {}
+for k, v in sd.items():
+    encdec, _layers, index, *suffix = k.split(".")
+    off = 1 if encdec == "decoder" else 0
+    (enc if encdec == "encoder" else dec)[".".join([str(int(index) + off), *suffix])] = v
+save_file(enc, "models/vae_approx/taef2_encoder.safetensors")
+save_file(dec, "models/vae_approx/taef2_decoder.safetensors")
+```
+
+3. `imggen -m moss --preset 1280 "..."` (or `--vae taef2` on any run).
+
+Measured on the reference machine: 1280² two-pass is ~13s warm / ~24s cold,
+and PSNR against the full VAE decode is ~39.9 dB. Text rendering suffers from
+any second pass (`denoise2 > 0` repaints glyphs), so use single-pass 1024 for
+text-heavy prompts.
+
 ## Safety
 
 - Both tools bind only to `127.0.0.1` by default. `IMGPOOL_BIND` can expose one

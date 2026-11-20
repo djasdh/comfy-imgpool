@@ -117,11 +117,21 @@ MODELS = {
             "1024": dict(width=1024, height=1024, steps=4, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=9.0),
+            # 二采：1024 首采 -> 1280（1.25×，输出是 8 的倍数）
+            "1280": dict(width=1024, height=1024, steps=4, cfg=1.0,
+                         sampler="euler", scheduler="simple", denoise=1.0,
+                         two_pass=True, scale=1.25, steps2=4, denoise2=0.2,
+                         vae="taef2", est_seconds=None),
         },
         "risky_presets": {
             "1536": dict(width=1536, height=1536, steps=4, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=None),
+            # 二采：1024 首采 -> 1536（1.5×，之前跑挂过，需 --allow-risky）
+            "1536-2pass": dict(width=1024, height=1024, steps=4, cfg=1.0,
+                               sampler="euler", scheduler="simple", denoise=1.0,
+                               two_pass=True, scale=1.5, steps2=4, denoise2=0.3,
+                               vae="taef2", est_seconds=None),
         },
     },
     "anima": {
@@ -420,7 +430,7 @@ def build_graph(a, spec, prompt_text, edit_image):
     model_ref = ["20", 0]
 
     add(3, "CLIPLoader", dict(a.mcfg["clip"]))
-    add(4, "VAELoader", {"vae_name": a.mcfg["vae"]})
+    add(4, "VAELoader", {"vae_name": spec.get("vae") or a.mcfg["vae"]})
 
     if edit_image:
         # MOSS edit：参考图 -> TextEncodeMOSSImageEdit；negative 用 ZeroOut 省一次 9B 前向
@@ -817,6 +827,7 @@ def build_parser():
     ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
                     help="moss / anima / krea2（默认 moss）")
     ap.add_argument("--variant", help="权重变体，见 --list（默认取模型自带变体）")
+    ap.add_argument("--vae", help="覆盖解码器（如 MOSS 二采用 taef2）")
     ap.add_argument("--preset", help="预设名，见 --list")
     ap.add_argument("--size", help="自定义尺寸 WxH（走单采，必须 64 对齐）")
     ap.add_argument("--width", type=int)
@@ -901,6 +912,8 @@ def main():
     a.loras = resolve_loras(a)
 
     spec, preset, custom = resolve_spec(a)
+    if a.vae:
+        spec["vae"] = a.vae
 
     # 参考图：复制到 ComfyUI/input 并哈希去重
     edit_name = None
@@ -1084,6 +1097,7 @@ def main():
         "variant": a.mcfg.get("variant"),
         "prompt_style": prompt_style,
         "supports_tags": a.mcfg.get("supports_tags", True),
+        "vae": spec.get("vae") or a.mcfg["vae"],
         "preset": preset,
         "width": spec["width"],
         "height": spec["height"],
