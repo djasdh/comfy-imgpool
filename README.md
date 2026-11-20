@@ -264,6 +264,9 @@ The `MODELS` table near the top of `bin/imggen` is the only place that knows abo
 - `unet`, `clip` (name + loader type), `vae`
 - accelerator flags for the `RDNA2Attention` node
 - memory thresholds (`min_avail_gb`, `vram_need_gb`)
+- `default_lora` / `default_lora_max_steps`: a LoRA mounted automatically while
+  `steps` stays at or below that value (MOSS uses this for its 4-step distilled
+  checkpoint; without it, `steps=4 cfg=1` only produces blur)
 - presets: resolution, steps, sampler, optional two-pass upscale
 
 If your ComfyUI does not have `RDNA2Attention` / `ForceUnloadModels`, remove those nodes from `build_graph()` (or keep a compatible node in your install). The measured timings in this repo come from a 16 GB AMD RX 6900 XT; they are reference numbers, not guarantees.
@@ -272,7 +275,10 @@ Presets are deliberately small and explicit rather than clever: a preset name ma
 
 ## Safety
 
-- Both tools bind only to `127.0.0.1`; there is no authentication. Do not expose the port.
+- Both tools bind only to `127.0.0.1` by default. `IMGPOOL_BIND` can expose one
+  interface; when you do that, set `IMGPOOL_TOKEN` (see
+  [Remote access and auth](#remote-access-and-auth)). Never expose the port to
+  the public internet.
 - `imgpool cancel` checks `--source` for ownership; crossing sources requires `--force`.
 - `imgpool stop` refuses to stop while jobs are running unless `--force`.
 - Memory guards can restart ComfyUI when host RAM or VRAM is too low; `--no-restart` disables that.
