@@ -63,6 +63,7 @@ imggen -m krea2 --preset 2k "cinematic swordswoman"
 imggen -m anima --size 1344x768 "wide cyberpunk street"
 imggen -m anima --lora modern-anime-lora:0.8 "portrait"
 imggen -m moss --lora ba "anime-style street at night"   # alias -> 0.8
+imggen -m moss --variant sft-int4 "a green apple"        # swap the weight file
 imggen --edit input.png "turn the sword into a glowing blue blade"   # MOSS edit
 imggen --dry -m krea2 "x"            # print the API graph without submitting
 ```
@@ -268,6 +269,11 @@ The `MODELS` table near the top of `bin/imggen` is the only place that knows abo
 - `default_lora` / `default_lora_max_steps`: a LoRA mounted automatically while
   `steps` stays at or below that value (MOSS uses this for its 4-step distilled
   checkpoint; without it, `steps=4 cfg=1` only produces blur)
+- `default_variant` / `variants`: interchangeable weight files for the same
+  graph. Each variant is a sparse override of the model entry (`unet`, `accel`,
+  memory thresholds, `notes`, ...). Select it with `--variant NAME` or the
+  `IMGPOOL_VARIANT` env var; `--list` reports every variant. MOSS ships
+  `sft-int8` (default), `sft-int4` and `sft-fp16`.
 - presets: resolution, steps, sampler, optional two-pass upscale
 
 If your ComfyUI does not have `RDNA2Attention` / `ForceUnloadModels`, remove those nodes from `build_graph()` (or keep a compatible node in your install). The measured timings in this repo come from a 16 GB AMD RX 6900 XT; they are reference numbers, not guarantees.
