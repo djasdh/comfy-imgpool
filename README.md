@@ -64,6 +64,7 @@ imggen -m anima --size 1344x768 "wide cyberpunk street"
 imggen -m anima --lora modern-anime-lora:0.8 "portrait"
 imggen -m moss --lora ba "anime-style street at night"   # alias -> 0.8
 imggen -m moss --variant sft-int4 "a green apple"        # swap the weight file
+imggen -m moss --steps 35 --cfg 3 --negative "worst quality, bad anatomy" "1girl, ..."
 imggen --edit input.png "turn the sword into a glowing blue blade"   # MOSS edit
 imggen --dry -m krea2 "x"            # print the API graph without submitting
 ```

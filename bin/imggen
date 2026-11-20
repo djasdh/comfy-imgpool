@@ -433,7 +433,10 @@ def build_graph(a, spec, prompt_text, edit_image):
         pos, neg = ["41", 0], ["42", 0]
     else:
         add(5, "CLIPTextEncode", {"text": prompt_text, "clip": ["3", 0]})
-        add(6, "ConditioningZeroOut", {"conditioning": ["5", 0]})
+        if a.negative and spec["cfg"] > 1.0:
+            add(6, "CLIPTextEncode", {"text": a.negative, "clip": ["3", 0]})
+        else:
+            add(6, "ConditioningZeroOut", {"conditioning": ["5", 0]})
         pos, neg = ["5", 0], ["6", 0]
 
     # 采样前卸载文本编码器（MOSS 7GB 必须；其他模型也无害）
@@ -760,6 +763,7 @@ def do_list():
             'imggen -m anima --lora modern-anime-lora:0.8 "提示词"',
             'imggen -m moss --lora ba "二次元场景"',
             'imggen -m moss --variant sft-int4 "提示词"',
+            'imggen -m moss --steps 35 --cfg 3 --negative "worst quality" "提示词"',
             'imggen --edit 图片路径 "编辑指令"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
@@ -796,6 +800,8 @@ def build_parser():
     ap.add_argument("--scale", type=float, help="覆盖二采放大倍数")
     ap.add_argument("--lora", action="append", default=[],
                     help="LoRA 名[:强度]，可重复")
+    ap.add_argument("--negative", help="负面提示词（cfg>1 时生效）")
+    ap.add_argument("--negative-file", help="从文件读负面提示词")
     ap.add_argument("--lora-strength", type=float, default=1.0,
                     help="未写强度时的默认 LoRA 强度")
     ap.add_argument("--edit", metavar="IMAGE", help="MOSS 参考图编辑的输入图片")
@@ -823,6 +829,9 @@ def main():
     prompt = a.prompt_opt or a.prompt
     if a.prompt_file:
         prompt = open(a.prompt_file, encoding="utf-8").read()
+    if a.negative_file:
+        a.negative = open(a.negative_file, encoding="utf-8").read()
+    a.negative = (a.negative or "").strip() or None
 
     if a.model not in MODELS:
         fail(2, "bad_model", f"未知模型 {a.model!r}",
@@ -1017,6 +1026,8 @@ def main():
         warnings.append("lora_on_quantized_model（量化权重上的 LoRA 效果需目视确认）")
     if preset.startswith("custom"):
         warnings.append("custom_size_single_pass")
+    if a.negative and spec["cfg"] <= 1.0:
+        warnings.append("negative_ignored_cfg1（cfg=1 不跑负面分支）")
 
     try:
         st = system_stats()

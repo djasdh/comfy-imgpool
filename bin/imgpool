@@ -1069,7 +1069,7 @@ def build_imggen_args(a, prompt):
     if a.source:
         pass  # source 只用于池元数据
     for name in ("seed", "preset", "variant", "size", "width", "height", "steps", "steps2",
-                 "cfg", "denoise", "denoise2", "scale", "out", "edit",
+                 "cfg", "denoise", "denoise2", "scale", "out", "edit", "negative",
                  "lora_strength", "edit_strength", "queue_wait", "lock_wait"):
         v = getattr(a, name, None)
         if v is None:
@@ -1084,6 +1084,8 @@ def build_imggen_args(a, prompt):
             args.append("--" + name.replace("_", "-"))
     if a.prompt_file:
         args += ["--prompt-file", os.path.abspath(a.prompt_file)]
+    if getattr(a, "negative_file", None):
+        args += ["--negative-file", os.path.abspath(a.negative_file)]
     return args
 
 
@@ -1397,6 +1399,8 @@ def build_parser():
     p.add_argument("--denoise", type=float)
     p.add_argument("--denoise2", type=float)
     p.add_argument("--scale", type=float)
+    p.add_argument("--negative")
+    p.add_argument("--negative-file")
     p.add_argument("--lora", action="append", default=[])
     p.add_argument("--lora-strength", type=float)
     p.add_argument("--edit")
