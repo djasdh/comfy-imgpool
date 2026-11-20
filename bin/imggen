@@ -158,6 +158,13 @@ MODELS = {
 DEFAULT_MODEL = "moss"
 DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
 
+# LoRA 别名 -> (文件名, 默认强度)。写 --lora ba 即等于 ba_style_moss_v09:0.8
+LORA_ALIASES = {
+    "ba": ("ba_style_moss_v09.safetensors", 0.8),
+    "zzz": ("zzz_anireal_moss_v1.safetensors", 1.5),
+}
+LORA_DEFAULTS = {v[0]: v[1] for v in LORA_ALIASES.values()}
+
 
 # ----------------------------------------------------------------------------
 # 输出 / 错误
@@ -494,7 +501,7 @@ def resolve_loras(a):
              "先运行 bin/comfy-ensure.sh")
     out = []
     for item in a.lora:
-        name, strength = item, a.lora_strength
+        name, strength = item, None
         if ":" in item:
             maybe_name, maybe_s = item.rsplit(":", 1)
             try:
@@ -502,12 +509,17 @@ def resolve_loras(a):
                 name = maybe_name
             except ValueError:
                 pass
+        alias = LORA_ALIASES.get(name)
+        if alias:
+            name = alias[0]
         if name not in names:
             if name + ".safetensors" in names:
                 name += ".safetensors"
             else:
                 fail(2, "unknown_lora", f"LoRA 不存在：{name}",
                      "可用：" + ", ".join(names))
+        if strength is None:
+            strength = LORA_DEFAULTS.get(name, a.lora_strength)
         out.append((name, strength))
     return out
 
@@ -643,12 +655,15 @@ def do_list():
         "default_model": DEFAULT_MODEL,
         "models": models,
         "loras": loras,
+        "lora_aliases": {k: {"file": v[0], "strength": v[1]}
+                         for k, v in LORA_ALIASES.items()},
         "usage": [
             'imggen "提示词"',
             'imggen -m anima "提示词"',
             'imggen -m krea2 --preset 2k "提示词"',
             'imggen -m anima --size 1344x768 "提示词"',
             'imggen -m anima --lora modern-anime-lora:0.8 "提示词"',
+            'imggen -m moss --lora ba "二次元场景"',
             'imggen --edit 图片路径 "编辑指令"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",

@@ -62,6 +62,7 @@ imggen -m anima "anime girl in a sunflower field"
 imggen -m krea2 --preset 2k "cinematic swordswoman"
 imggen -m anima --size 1344x768 "wide cyberpunk street"
 imggen -m anima --lora modern-anime-lora:0.8 "portrait"
+imggen -m moss --lora ba "anime-style street at night"   # alias -> 0.8
 imggen --edit input.png "turn the sword into a glowing blue blade"   # MOSS edit
 imggen --dry -m krea2 "x"            # print the API graph without submitting
 ```
@@ -272,6 +273,10 @@ The `MODELS` table near the top of `bin/imggen` is the only place that knows abo
 If your ComfyUI does not have `RDNA2Attention` / `ForceUnloadModels`, remove those nodes from `build_graph()` (or keep a compatible node in your install). The measured timings in this repo come from a 16 GB AMD RX 6900 XT; they are reference numbers, not guarantees.
 
 Presets are deliberately small and explicit rather than clever: a preset name maps to a fixed graph. Add or edit presets for your own models.
+
+`LORA_ALIASES` next to `DEFAULT_PRESET` maps a short name to `(file,
+default_strength)`, so `--lora ba` expands to `ba_style_moss_v09:0.8`.
+Edit it to match the LoRAs on your machine.
 
 ## Safety
 
