@@ -60,6 +60,8 @@ imggen --list                        # JSON capability list: models, presets, ti
 imggen "a red apple on a wooden table"
 imggen -m anima "anime girl in a sunflower field"
 imggen -m krea2 --preset 2k "cinematic swordswoman"
+imggen -m krea2 --preset 2k --latent "photoreal portrait"   # latent upscale (old path)
+imggen -m krea2 --preset 2k-direct "cinematic swordswoman"  # single-pass 2K
 imggen -m anima --size 1344x768 "wide cyberpunk street"
 imggen -m anima --lora modern-anime-lora:0.8 "portrait"
 imggen -m moss --lora ba "anime-style street at night"   # alias -> 0.8
@@ -298,9 +300,10 @@ Edit it to match the LoRAs on your machine.
 ```
 
 MOSS is `supports_tags: false` because its official recipe is natural
-language. The escape hatch is `--allow-format-mismatch`; the result then
-carries a `format_mismatch_forced` warning. Both `imggen` and `imgpool
-submit` accept it.
+language, and Krea2 is too: its Qwen3VL text encoder expects prose, so a
+`tag` prompt is rejected the same way. The escape hatch is
+`--allow-format-mismatch`; the result then carries a
+`format_mismatch_forced` warning. Both `imggen` and `imgpool submit` accept it.
 
 ## MOSS two-pass and TAEF2
 
@@ -333,14 +336,44 @@ and PSNR against the full VAE decode is ~39.9 dB. Text rendering suffers from
 any second pass (`denoise2 > 0` repaints glyphs), so use single-pass 1024 for
 text-heavy prompts.
 
-### Krea 2 two-pass
+### Krea 2 two-pass and direct 2K
 
-`krea2 --preset 2k` renders 720×1280 first, then a 1.6× latent upscale
-(1152×2048) with `steps2 8, denoise2 0.15`. Higher denoise repaints the face
-and breaks the eyes on the 8-step turbo weights. The decode uses
-`VAEDecodeTiled`: the Qwen Image VAE reserves ~4 GB for a full-frame 2K decode,
-which does not fit next to the resident 12B UNET, and tiling costs almost
-nothing on this VAE. `--scale 1.5` (1080×1920) is the fallback if VRAM is tight.
+`krea2 --preset 2k` renders 720×1280 first, then upscales **in pixel space**
+with a 2× anime SR model (`2x-AnimeSharpV2_RPLKSR_Sharp.pth` →
+`ImageScaleBy 0.8` → 1152×2048), re-encodes, and refines for 8 steps at
+`denoise2 0.12`.
+
+Pixel upscaling is the default because a latent upscale destroys line art. A
+bislerp-expanded latent carries no real high-frequency detail, so a 4-step
+denoise-0.30 pass cannot pull sharp lines back out: hair and lashes smear into
+watercolor edges while PSNR/SSIM still look healthy (both metrics flatter
+softness). The SR model supplies the high frequencies; the low-denoise pass
+only integrates its aliasing. That is why 0.12 beats 0.20 here (0.20 slightly
+rounds the face) and beats no refine at all (moiré on straw and fabric
+texture). At 1:1 the gap between this and the latent path is obvious; at
+thumbnail size it is not.
+
+`--latent` restores the old latent-upscale path (`steps2 4, denoise2 0.30`).
+Keep it for photoreal output, where the extra texture the latent refine invents
+is welcome, and where it is ~30 s faster.
+
+Warm timings on the 16 GB RX 6900 XT (int4): `2k` ≈ 47 s with pixel upscaling,
+≈ 18 s with `--latent`; the first run after a model swap ≈ 77 s (SR weights and
+kernels). Decode uses `VAEDecodeTiled`: the Qwen Image VAE reserves ~4 GB for a
+full-frame 2K decode, which does not fit next to the resident 12B UNET, and
+tiling costs almost nothing on this VAE. `--scale 1.5` (1080×1920) is the
+fallback if VRAM is tight.
+
+The bundled SR model is **CC-BY-NC-SA 4.0** (non-commercial, share-alike). For
+commercial output, change `upscale_model` in the preset to a permissively
+licensed upscaler (and re-check the numbers — a 4× model also works but the
+2880×5120 intermediate costs ~50 s extra).
+
+`krea2 --preset 2k-direct` samples 1152×2048 in a single pass at 8 steps. The
+prompt guides every step at full resolution instead of refining an upscaled
+720×1280 latent, so fine detail is better and the layout is not locked in by
+the first pass. It costs more sampling time than `2k`: use `2k` when you want
+a predictable composition, `2k-direct` when detail matters more.
 
 ## Safety
 

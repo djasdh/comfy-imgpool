@@ -8,7 +8,8 @@
   imggen --list                                   # JSON 能力清单
   imggen "提示词"                                  # 默认 moss / 1024² / 4 步
   imggen -m anima "提示词"                         # 1024→1536 二采，12 秒
-  imggen -m krea2 --preset 2k "提示词"             # 1152×2048 二采，27 秒
+  imggen -m krea2 --preset 2k "提示词"             # 1152×2048 二采，锁构图
+  imggen -m krea2 --preset 2k-direct "提示词"      # 1152×2048 单采，细节更好
   imggen -m moss --size 1024 "提示词"
   imggen -m anima --width 1344 --height 768 "提示词"   # 自定义尺寸走单采
   imggen -m anima --lora modern-anime-lora:0.8 "提示词"
@@ -182,7 +183,7 @@ MODELS = {
     },
     "krea2": {
         "display": "Krea2 Turbo int4 convrot（Qwen Image VAE）",
-        "supports_tags": True,
+        "supports_tags": False,  # Qwen3VL 文本编码器，官方用法是自然语言描述
         "unet": "krea2_turbo-int4_convrot.safetensors",
         "default_variant": "int4",
         "variants": {
@@ -203,15 +204,56 @@ MODELS = {
         "min_avail_gb": 8.0,          # int4 权重 6.9GB；低于 8GB 才重启
         "vram_need_gb": 12.0,         # int4 6.6GB + TE 5GB 分时驻留 + 2K latent 余量
         "custom_steps": 8,
-        "notes": "int4 与 int8 不同构图（同 seed SSIM 0.53）。2K 二采 4 步与 8 步 SSIM 0.944。",
+        "notes": "int4 与 int8 不同构图（同 seed SSIM 0.53）。2K 二采默认走像素放大（AnimeSharp 2x -> 0.8 -> 8 步 denoise 0.12），latent 旧链路用 --latent 显式开启。提示词用自然语言，tag 会被拒绝。",
         "presets": {
+            # 二采默认走像素放大（二次元线条优先）：AnimeSharp 2x -> 0.8 -> 8 步 0.12。
+            # latent 4 步 0.30 会把二次元的线稿抹糊（发丝/睫毛糊成一片），
+            # 像素 SR 先把线条撑住，再用极低 denoise 整合 SR 的高频与锯齿。
+            # --latent 回退到旧链路（4 步 0.30），写实图仍可用。
             "2k": dict(width=720, height=1280, steps=8, cfg=1.0,
                        sampler="euler", scheduler="simple", denoise=1.0,
-                       two_pass=True, scale=1.6, steps2=8, denoise2=0.15,
-                       vae_tiled=True, est_seconds=27.2),
+                       two_pass=True, scale=1.6,
+                       upscale_mode="pixel",
+                       upscale_model="2x-AnimeSharpV2_RPLKSR_Sharp.pth",
+                       upscale_ratio=2.0,
+                       steps2=8, denoise2=0.12,
+                       latent_steps2=4, latent_denoise2=0.30,
+                       vae_tiled=True, est_seconds=40.0),
+            # 横幅二采（16:10 附近，对齐 bilibili 参考图 864x590 的 1.46 比例）
+            # 首采 1024x704 -> x1.5 = 1536x1056
+            "land2k": dict(width=1024, height=704, steps=8, cfg=1.0,
+                           sampler="euler", scheduler="simple", denoise=1.0,
+                           two_pass=True, scale=1.5, steps2=8, denoise2=0.30,
+                           vae_tiled=True, est_seconds=48.0),
+            # 单采 2K：不做首采+放大，构图不再被低分辨率首采锁住
+            "2k-direct": dict(width=1152, height=2048, steps=8, cfg=1.0,
+                              sampler="euler", scheduler="simple",
+                              denoise=1.0, vae_tiled=True,
+                              est_seconds=34.0),
             "720p": dict(width=720, height=1280, steps=8, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=10.1),
+            # 方形二采（karras 版）：首采 1088 -> 二采 x1.5 = 1632x1632
+            # karras + denoise 0.35：避免 simple + 0.25 在 bislerp 软边上反复描线
+            "sq2k-karras": dict(width=1088, height=1088, steps=8, cfg=1.0,
+                                sampler="euler", scheduler="karras", denoise=1.0,
+                                two_pass=True, scale=1.5, steps2=4, denoise2=0.35,
+                                vae_tiled=True, est_seconds=50.0),
+            # A: latent 放大改 bilinear（更平滑，少生成插值锐边）
+            "sq2k-bilinear": dict(width=1088, height=1088, steps=8, cfg=1.0,
+                                  sampler="euler", scheduler="karras", denoise=1.0,
+                                  two_pass=True, scale=1.5, steps2=4, denoise2=0.35,
+                                  upscale_method="bilinear", vae_tiled=True, est_seconds=50.0),
+            # B: 关分块 VAE 解码（排除 tile 接缝/纹理重复）
+            "sq2k-notile": dict(width=1088, height=1088, steps=8, cfg=1.0,
+                                sampler="euler", scheduler="karras", denoise=1.0,
+                                two_pass=True, scale=1.5, steps2=4, denoise2=0.35,
+                                vae_tiled=False, est_seconds=55.0),
+            # C: 二采 denoise 抬到 0.5（真正重绘细节，而不是强化插值线）
+            "sq2k-d50": dict(width=1088, height=1088, steps=8, cfg=1.0,
+                             sampler="euler", scheduler="karras", denoise=1.0,
+                             two_pass=True, scale=1.5, steps2=4, denoise2=0.5,
+                             vae_tiled=True, est_seconds=55.0),
         },
         "risky_presets": {},
     },
@@ -226,6 +268,11 @@ LORA_ALIASES = {
     "zzz": ("zzz_anireal_moss_v1.safetensors", 1.5),
     "ba2": ("BArtstyle-KREA2-V2-1024.safetensors", 0.8),
     "thick": ("krea2_style_magful.safetensors", 1.0),
+    # 商业立绘 + 照片背景（2026-11-21 实测）：单用偏写实，
+    # 推荐组合 --lora thick:0.6 --lora ra:0.4 --lora ur:0.3
+    "ra": ("krea2_realanime_semireal_v1.safetensors", 0.8),
+    "rs": ("krea2_real_scene_anime_v1.safetensors", 0.6),
+    "ur": ("krea2_ultrareal_v2.safetensors", 0.5),
 }
 LORA_DEFAULTS = {v[0]: v[1] for v in LORA_ALIASES.values()}
 
@@ -470,17 +517,47 @@ def build_graph(a, spec, prompt_text, edit_image):
     last = ["8", 0]
 
     if spec.get("two_pass"):
-        add(9, "LatentUpscaleBy", {
-            "samples": last, "upscale_method": spec.get("upscale_method", "bislerp"),
-            "scale_by": spec["scale"],
-        })
-        add(10, "KSampler", {
-            "model": ["19", 0], "seed": seed, "steps": spec["steps2"],
-            "cfg": spec["cfg"], "sampler_name": spec["sampler"],
-            "scheduler": spec["scheduler"], "positive": pos, "negative": neg,
-            "latent_image": ["9", 0], "denoise": spec["denoise2"],
-        })
-        last = ["10", 0]
+        if spec.get("upscale_mode") == "pixel":
+            # 像素放大链路：解码 -> SR 模型 -> 缩到目标尺寸 -> 重新编码 -> 低 denoise 精修。
+            # 二次元线稿必须走这条：latent 放大靠插值撑边，低步数二采收敛不回来。
+            tile = spec.get("vae_tile_size", 512)
+            add(13, "VAEDecodeTiled", {
+                "samples": last, "vae": ["4", 0],
+                "tile_size": tile, "overlap": 64,
+                "temporal_size": 64, "temporal_overlap": 8,
+            })
+            add(14, "UpscaleModelLoader", {"model_name": spec["upscale_model"]})
+            add(15, "ImageUpscaleWithModel", {
+                "upscale_model": ["14", 0], "image": ["13", 0],
+            })
+            add(16, "ImageScaleBy", {
+                "image": ["15", 0], "upscale_method": "lanczos",
+                "scale_by": spec["scale"] / spec.get("upscale_ratio", 2.0),
+            })
+            add(17, "VAEEncodeTiled", {
+                "pixels": ["16", 0], "vae": ["4", 0],
+                "tile_size": tile, "overlap": 64,
+                "temporal_size": 64, "temporal_overlap": 8,
+            })
+            add(10, "KSampler", {
+                "model": ["19", 0], "seed": seed, "steps": spec["steps2"],
+                "cfg": spec["cfg"], "sampler_name": spec["sampler"],
+                "scheduler": spec["scheduler"], "positive": pos, "negative": neg,
+                "latent_image": ["17", 0], "denoise": spec["denoise2"],
+            })
+            last = ["10", 0]
+        else:
+            add(9, "LatentUpscaleBy", {
+                "samples": last, "upscale_method": spec.get("upscale_method", "bislerp"),
+                "scale_by": spec["scale"],
+            })
+            add(10, "KSampler", {
+                "model": ["19", 0], "seed": seed, "steps": spec["steps2"],
+                "cfg": spec["cfg"], "sampler_name": spec["sampler"],
+                "scheduler": spec["scheduler"], "positive": pos, "negative": neg,
+                "latent_image": ["9", 0], "denoise": spec["denoise2"],
+            })
+            last = ["10", 0]
 
     if spec.get("vae_tiled"):
         add(11, "VAEDecodeTiled", {
@@ -509,6 +586,12 @@ def detect_prompt_style(text):
     t = (text or "").strip()
     if not t:
         return "empty"
+    # MOSS 官方 layout 提示词就是一段 JSON 对象，不能按 tag 处理
+    try:
+        if isinstance(json.loads(t), dict):
+            return "layout"
+    except (TypeError, ValueError):
+        pass
     s = re.sub(r'"[^"]*"|“[^”]*”|「[^」]*」', " ", t)
     parts = [p.strip() for p in re.split(r"[,，\n]+", s) if p.strip()]
     if not parts:
@@ -525,6 +608,11 @@ def detect_prompt_style(text):
         s, re.I))
     if (len(parts) >= 4 and avg <= 3.5 and sentences == 0
             and long_parts == 0 and markers < 8):
+        return "tag"
+    # 3 段短 tag 也常见（1girl, black hair, purple eyes）；但没有冠词/介词/连词，
+    # 以免把 "a cat, a dog, and a bird" 这类自然列举误判成 tag
+    if (len(parts) == 3 and avg <= 3.5 and sentences == 0
+            and long_parts == 0 and markers == 0):
         return "tag"
     if sentences >= 1 or avg >= 6 or markers >= 8:
         return "natural"
@@ -589,6 +677,8 @@ def resolve_spec(a):
         spec = dict(width=w, height=h, steps=a.steps or cfg["custom_steps"],
                     cfg=1.0 if a.cfg is None else a.cfg,
                     sampler="euler", scheduler="simple", denoise=1.0)
+        if a.vae_tiled:
+            spec["vae_tiled"] = True
         return spec, f"custom-{w}x{h}", True
 
     preset = a.preset or DEFAULT_PRESET[a.model]
@@ -603,6 +693,12 @@ def resolve_spec(a):
     else:
         avail = sorted(list(cfg["presets"]) + list(cfg.get("risky_presets", {})))
         fail(2, "bad_preset", f"{a.model} 没有预设 {preset!r}", f"可选：{', '.join(avail)}")
+
+    # --latent：二采回退到 latent 放大（krea2 的 2k 默认是像素放大链路）
+    if spec.get("two_pass") and a.latent and spec.get("upscale_mode") == "pixel":
+        spec["upscale_mode"] = "latent"
+        spec["steps2"] = spec.get("latent_steps2", spec["steps2"])
+        spec["denoise2"] = spec.get("latent_denoise2", spec["denoise2"])
 
     # 显式覆盖
     if a.steps is not None:
@@ -623,6 +719,8 @@ def resolve_spec(a):
             fail(2, "bad_scale",
                  f"二采输出 {out_w:g}x{out_h:g} 不是 8 的倍数，VAE 解码会从 1.5s 变 124s",
                  "换一个让输出对齐 8 的 scale（如 1.5 / 1.6 / 2.0）")
+    if a.vae_tiled:
+        spec["vae_tiled"] = True
     return spec, preset, False
 
 
@@ -762,9 +860,12 @@ def do_list():
                 item.update({
                     "two_pass": True, "scale": p["scale"],
                     "steps2": p["steps2"], "denoise2": p["denoise2"],
+                    "upscale_mode": p.get("upscale_mode", "latent"),
                     "output_width": int(p["width"] * p["scale"]),
                     "output_height": int(p["height"] * p["scale"]),
                 })
+                if p.get("upscale_model"):
+                    item["upscale_model"] = p["upscale_model"]
                 item.pop("estimated_seconds_hot")
                 item["estimated_seconds_hot"] = p.get("est_seconds")
             presets.append(item)
@@ -812,6 +913,8 @@ def do_list():
             'imggen "提示词"',
             'imggen -m anima "提示词"',
             'imggen -m krea2 --preset 2k "提示词"',
+            'imggen -m krea2 --preset 2k --latent "提示词"',
+            'imggen -m krea2 --preset 2k-direct "提示词"',
             'imggen -m anima --size 1344x768 "提示词"',
             'imggen -m anima --lora modern-anime-lora:0.8 "提示词"',
             'imggen -m moss --lora ba "二次元场景"',
@@ -853,6 +956,10 @@ def build_parser():
     ap.add_argument("--denoise", type=float, help="覆盖首采 denoise")
     ap.add_argument("--denoise2", type=float, help="覆盖二采 denoise")
     ap.add_argument("--scale", type=float, help="覆盖二采放大倍数")
+    ap.add_argument("--latent", action="store_true",
+                    help="二采回退到 latent 放大（krea2 2k 默认走像素放大，线条更好）")
+    ap.add_argument("--vae-tiled", action="store_true",
+                    help="分块 VAE 解码（大分辨率省显存，Qwen VAE 几乎不掉速）")
     ap.add_argument("--lora", action="append", default=[],
                     help="LoRA 名[:强度]，可重复")
     ap.add_argument("--negative", help="负面提示词（cfg>1 时生效）")
