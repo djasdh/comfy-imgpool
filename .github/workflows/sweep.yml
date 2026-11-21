@@ -1,0 +1,35 @@
+name: sweep
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: sweep
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: self-hosted
+    timeout-minutes: 20
+    steps:
+      # 工具代码在 runner 主机的固定路径，不在被测仓库里，因此不执行 checkout。
+      - name: dispatch unprocessed issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          cd /home/umr/Projects/software-test-sandbox
+          gh issue list --state open --limit 20 --json number \
+            --jq '.[].number' | while read -r n; do
+              if [ -e "state/processed/$n" ] || [ -e "state/rejected/$n" ]; then
+                continue
+              fi
+              gh workflow run agent-fix.yml -f "issue=$n" || true
+            done
