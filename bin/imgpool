@@ -1084,7 +1084,7 @@ def build_imggen_args(a, prompt):
         for v in getattr(a, name, []) or []:
             args += ["--" + name, v]
     for name in ("allow_risky", "no_restart", "allow_format_mismatch", "latent",
-                 "no_refine_sr", "anypaint_sr"):
+                 "native", "no_refine_sr", "anypaint_sr"):
         if getattr(a, name, False):
             args.append("--" + name.replace("_", "-"))
     if a.prompt_file:
@@ -1420,6 +1420,8 @@ def build_parser():
     p.add_argument("--size")
     p.add_argument("--aspect", metavar="W:H",
                    help="按长宽比选尺寸（1:1 / 16:9 / 9:16 / 4:5），二采同比例放大")
+    p.add_argument("--native", action="store_true",
+                   help="吸附到模型原生分辨率档位（忽略预设面积）")
     p.add_argument("--width", type=int)
     p.add_argument("--height", type=int)
     p.add_argument("--steps", type=int)
