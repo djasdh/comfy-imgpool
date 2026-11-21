@@ -71,6 +71,8 @@ imggen -m moss --steps 35 --cfg 3 --negative "worst quality, bad anatomy" "1girl
 imggen --edit input.png "turn the sword into a glowing blue blade"   # MOSS edit
 imggen -m krea2 --inpaint out.png --rect 600,500,400,450 "sharper face"  # local refine
 imggen -m krea2 --inpaint out.png --mask mask.png "detailed eyes"        # white = redraw
+imggen -m krea2 --anypaint out.png --rect 80,1210,940,838 "sailor uniform"  # semantic local edit
+imggen -m krea2 --anypaint out.png --mask mask.png --anypaint-sr "..."     # edit + 2x SR
 imggen --dry -m krea2 "x"            # print the API graph without submitting
 ```
 
@@ -447,6 +449,51 @@ What the defaults mean:
 Measured 17 s warm, 24 s cold, on the same 16 GB card. This refines detail; it
 does not invent missing structure. If the source face is already soft from a
 latent upscale, refine the 720p pass and then run the pixel two-pass.
+
+### Local edit (`--anypaint`)
+
+`--anypaint` is the semantic counterpart to `--inpaint`. It runs the Krea 2
+AnyPaint LoRA at full denoise with the mask as a hard constraint: white pixels
+are regenerated, black pixels are preserved through a timestep-matched latent
+constraint, so the face, hair and background outside the mask stay put.
+
+Use it when the region needs *different content* (swap a cardigan for a sailor
+uniform, add an object, replace a sign), not just more detail.
+
+```bash
+imggen -m krea2 --anypaint out.png --rect 80,1210,940,838 "prompt"
+imggen -m krea2 --anypaint out.png --mask mask.png "prompt"
+imggen -m krea2 --anypaint out.png --rect ... --anypaint-sr "prompt"
+```
+
+| flag | default | meaning |
+|---|---|---|
+| `--anypaint-boundary` | 32 | pixels redrawn around the mask edge to blend the seam |
+| `--anypaint-ref-edge` | 384 | long edge of the semantic reference fed to Qwen3-VL |
+| `--anypaint-sr` | off | append a 2× AnimeSharp upscale after decoding |
+| `--anypaint-sr-model` | `2x-AnimeSharpV2_RPLKSR_Sharp.pth` | SR model for `--anypaint-sr` |
+
+AnyPaint is trained for **Krea 2 Turbo at 8 steps, CFG 1**, and the sampler must
+run at `denoise 1.0` — the known-region constraint replaces the low-denoise
+trick. `--steps` and `--cfg` still override if you need to experiment.
+
+Two practical notes from the upstream issues:
+
+- the mask semantics are white = generate, black = keep (the reverse of some
+  inpainting UIs);
+- describe the **whole target image**, not only what goes inside the mask. The
+  prompt is encoded globally, and a mask-only description tends to draw the new
+  object everywhere.
+
+The LoRA ships as `krea2_anypaint_rank32.safetensors` (228 MB) and requires the
+ComfyUI nodes from `alexw5702-afk/krea2-anypaint`. On the 16 GB card, use the
+**int4** UNET: the int8 weights are 13 GB and make ComfyUI page constantly, which
+freezes the whole desktop. Measured 85 s cold, 47 s warm at 1152×2048.
+
+Mask-region values are not bit-reproducible across runs even with a fixed seed
+(mean diff ≈ 10 inside the mask, ≈ 0.3 outside): the 8-step int4 trajectory
+diverges on the boundary tokens. Pick the run you like rather than relying on
+re-running a seed.
 
 ## LoRA catalog
 

@@ -214,6 +214,23 @@
         "2026-11-21：局部重生 d0.45 下 0.7 有可见增益（虹膜高光、皮肤纹理），1.0 开始出现散落白点。"
       ],
       "verified": true
+    },
+    {
+      "file": "krea2_anypaint_rank32.safetensors",
+      "kind": "functional",
+      "description": "AnyPaint 局部编辑 LoRA：mask 白=重绘，其余像素由 timestep 约束保留；imggen --anypaint 自动挂载。",
+      "tags": ["edit", "inpaint", "anypaint", "mask"],
+      "aliases": [],
+      "default_strength": 1.0,
+      "recommended": "1.0（--anypaint 时自动加载）",
+      "trigger": null,
+      "license": "krea-2-community",
+      "commercial_ok": null,
+      "source": "https://huggingface.co/yijunwang2/krea2-anypaint",
+      "tested": [
+        "2026-11-21：1152x2048 局部换装，85s 冷 / 47s 热，mask 外 mean diff 0.3。"
+      ],
+      "verified": true
     }
   ]
 }

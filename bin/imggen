@@ -212,6 +212,9 @@ MODELS = {
         "min_avail_gb": 8.0,          # int4 权重 6.9GB；低于 8GB 才重启
         "vram_need_gb": 12.0,         # int4 6.6GB + TE 5GB 分时驻留 + 2K latent 余量
         "custom_steps": 8,
+        # AnyPaint 局部编辑：mask 白=重绘，其余像素由 timestep 约束保留。
+        # 必须用 int4：int8 权重 13GB 在 16GB 卡上会持续换页，整机卡死。
+        "anypaint_lora": "krea2_anypaint_rank32.safetensors",
         "notes": "int4 与 int8 不同构图（同 seed SSIM 0.53）。2K 二采默认走像素放大（AnimeSharp 2x -> 0.8 -> 8 步 denoise 0.12），latent 旧链路用 --latent 显式开启。提示词用自然语言，tag 会被拒绝。",
         "presets": {
             # 二采默认走像素放大（二次元线条优先）：AnimeSharp 2x -> 0.8 -> 8 步 0.12。
@@ -635,6 +638,69 @@ def build_graph(a, spec, prompt_text, edit_image):
     return g
 
 
+def build_anypaint_graph(a, spec, prompt_text, src_name, mask_name):
+    """Krea2 AnyPaint 局部编辑：mask 白=重绘，其余像素按 timestep 约束保留。
+
+    mask 外的内容（脸、头发、背景）不参与采样，所以构图不会漂移。
+    """
+    g = {}
+
+    def add(nid, ctype, inputs):
+        g[str(nid)] = {"class_type": ctype, "inputs": inputs}
+
+    add(1, "UNETLoader", {"unet_name": a.mcfg["unet"],
+                          "weight_dtype": "default"})
+    # AnyPaint LoRA 必须挂在最后：它把 reference latent 接进 in-context 通道。
+    loras = list(a.loras) + [(a.mcfg["anypaint_lora"], 1.0)]
+    model_ref = ["1", 0]
+    for i, (name, strength) in enumerate(loras):
+        nid = 30 + i
+        add(nid, "LoraLoaderModelOnly",
+            {"model": model_ref, "lora_name": name,
+             "strength_model": strength})
+        model_ref = [str(nid), 0]
+    add(20, "RDNA2Attention", {"model": model_ref, **a.mcfg["accel"]})
+    add(21, "Krea2AnyPaintModelPatch", {"model": ["20", 0],
+                                        "kv_cache": True})
+
+    add(3, "CLIPLoader", dict(a.mcfg["clip"]))
+    add(4, "VAELoader", {"vae_name": spec["vae"]})
+
+    add(50, "LoadImage", {"image": src_name, "upload": "image"})
+    add(51, "LoadImageMask", {"image": mask_name, "channel": "red"})
+    add(52, "Krea2AnyPaintPrepare", {
+        "source": ["50", 0], "generated_mask": ["51", 0],
+        "left": 0, "top": 0, "right": 0, "bottom": 0,
+        "reference_max_edge": a.anypaint_ref_edge,
+        "boundary_redraw_px": a.anypaint_boundary,
+    })
+    add(53, "Krea2AnyPaintEncode", {
+        "clip": ["3", 0], "prompt": prompt_text, "vae": ["4", 0],
+        "semantic_reference": ["52", 0], "known_image": ["52", 1],
+        "keep_mask": ["52", 3], "vlm_reference": True,
+    })
+    add(54, "CLIPTextEncode", {"clip": ["3", 0], "text": a.negative or ""})
+    add(55, "ForceUnloadModels",
+        {"model": ["21", 0], "positive": ["53", 0], "negative": ["54", 0]})
+    add(56, "KSampler", {
+        "model": ["55", 0], "seed": a.seed, "steps": spec["steps"],
+        "cfg": spec["cfg"], "sampler_name": spec["sampler"],
+        "scheduler": spec["scheduler"], "positive": ["53", 0],
+        "negative": ["54", 0], "latent_image": ["53", 1], "denoise": 1.0,
+    })
+    add(57, "VAEDecodeTiled", {"samples": ["56", 0], "vae": ["4", 0],
+                               "tile_size": 512, "overlap": 64,
+                               "temporal_size": 64, "temporal_overlap": 8})
+    last = ["57", 0]
+    if a.anypaint_sr:
+        add(59, "UpscaleModelLoader", {"model_name": a.anypaint_sr_model})
+        add(60, "ImageUpscaleWithModel", {"upscale_model": ["59", 0],
+                                          "image": last})
+        last = ["60", 0]
+    add(58, "SaveImage", {"images": last, "filename_prefix": a.out})
+    return g
+
+
 def build_refine_graph(a, spec, prompt_text, src_name, mask_name,
                        sample_name, crop):
     """局部细化：crop -> 可选 SR 放大 -> mask 内低 denoise 采样 -> 羽化贴回。
@@ -917,6 +983,61 @@ def prepare_refine(a):
             (cx, cy, cw, ch, tw, th), shrink, (W, H))
 
 
+def prepare_anypaint(a):
+    """读源图/区域，写 AnyPaint 用的 mask（白=重绘，不做羽化）。
+
+    边界融合交给 AnyPaint 的 boundary_redraw_px，mask 本身保持硬边。
+    """
+    from PIL import Image, ImageDraw
+
+    src_name, src = _copy_image(a.anypaint, "imggen_anypaint")
+    im = Image.open(src)
+    W, H = im.size
+
+    if a.rect:
+        m = re.fullmatch(r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*",
+                         a.rect)
+        if not m:
+            fail(2, "bad_rect", f"--rect 需要 X,Y,W,H，收到 {a.rect!r}",
+                 "例：--rect 600,500,400,450")
+        x, y, w, h = (int(v) for v in m.groups())
+        if w <= 0 or h <= 0 or x < 0 or y < 0 or x + w > W or y + h > H:
+            fail(2, "bad_rect", f"--rect {a.rect} 超出图片范围 {W}x{H}",
+                 f"x+w ≤ {W}，y+h ≤ {H}")
+        mask = Image.new("L", (W, H), 0)
+        ImageDraw.Draw(mask).rectangle((x, y, x + w - 1, y + h - 1),
+                                       fill=255)
+        key_src = a.rect
+    else:
+        _, mask_path = _copy_image(a.mask, "imggen_mask_in")
+        mask = Image.open(mask_path).convert("L")
+        if mask.size != (W, H):
+            fail(2, "mask_size_mismatch",
+                 f"mask {mask.size[0]}x{mask.size[1]} 与源图 {W}x{H} 不一致",
+                 "mask 按原图像素坐标绘制，不需要缩放")
+        key_src = hashlib.sha1(mask.tobytes()).hexdigest()[:12]
+
+    if not mask.point(lambda v: 255 if v > 127 else 0).getbbox():
+        fail(2, "empty_mask", "mask 全黑，没有可重绘的区域",
+             "白色（>127）才是重绘区域")
+
+    key = hashlib.sha1(f"{W}x{H}|{key_src}|{a.anypaint_boundary}".encode()
+                       ).hexdigest()[:12]
+    mask_name = f"imggen_anypaint_mask_{key}.png"
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    mask.convert("RGB").save(os.path.join(INPUT_DIR, mask_name))
+    return src_name, mask_name, (W, H)
+
+
+def anypaint_spec(a, size):
+    """AnyPaint 固定 denoise=1，尺寸跟源图一致。"""
+    return dict(width=size[0], height=size[1],
+                steps=8 if a.steps is None else a.steps,
+                cfg=1.0 if a.cfg is None else a.cfg,
+                sampler="euler", scheduler="simple", denoise=1.0,
+                vae=a.vae or a.mcfg["vae"])
+
+
 def resolve_spec(a):
     """返回 (spec, preset_name, custom)。--size/--width/--height 走单采。"""
     cfg = a.mcfg
@@ -1172,6 +1293,7 @@ def do_list():
             "min_available_memory_gb": cfg["min_avail_gb"],
             "min_free_vram_gb": cfg["vram_need_gb"],
             "supports_edit": name == "moss",
+            "supports_anypaint": bool(cfg.get("anypaint_lora")),
             "default_lora": cfg.get("default_lora"),
             "supports_tags": cfg.get("supports_tags", True),
             "default_variant": cfg.get("default_variant"),
@@ -1220,6 +1342,8 @@ def do_list():
             'imggen -m krea2 --inpaint 成片.png --rect 600,500,400,450 "描述"',
             'imggen -m krea2 --inpaint 成片.png --rect 600,500,400,450 --refine-level 3 "描述"',
             'imggen -m krea2 --inpaint 成片.png --mask mask.png "描述"',
+            'imggen -m krea2 --anypaint 成片.png --rect 600,500,400,450 "描述"',
+            'imggen -m krea2 --anypaint 成片.png --mask mask.png --anypaint-sr "描述"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
                        "4": "内存不足", "5": "提交被拒", "6": "执行失败或超时"},
@@ -1275,6 +1399,18 @@ def build_parser():
                     help="重绘区域（原图像素坐标），与 --mask 互斥")
     ap.add_argument("--mask", metavar="IMAGE",
                     help="黑白 mask 图，白=重绘；与 --rect 互斥")
+    ap.add_argument("--anypaint", metavar="IMAGE",
+                    help="Krea2 AnyPaint 局部编辑的源图；配合 --rect/--mask "
+                         "指定区域（白=重绘），构图和未覆盖像素保持不变")
+    ap.add_argument("--anypaint-boundary", type=int, default=32,
+                    help="AnyPaint 在 mask 边界重画的像素，默认 32")
+    ap.add_argument("--anypaint-ref-edge", type=int, default=384,
+                    help="AnyPaint 语义参考图长边，默认 384")
+    ap.add_argument("--anypaint-sr", action="store_true",
+                    help="AnyPaint 出图后接 2x 超分")
+    ap.add_argument("--anypaint-sr-model",
+                    default="2x-AnimeSharpV2_RPLKSR_Sharp.pth",
+                    help="--anypaint-sr 使用的超分模型")
     ap.add_argument("--refine-denoise", type=float,
                     help="局部重绘 denoise；默认由 --refine-level 决定")
     ap.add_argument("--refine-level", type=int, default=1, choices=(1, 2, 3, 4),
@@ -1345,6 +1481,24 @@ def main():
     if a.inpaint and a.edit:
         fail(2, "bad_args", "--inpaint 与 --edit 不能同时使用",
              "--inpaint 是局部重绘，--edit 是整图指令编辑")
+    if a.anypaint:
+        if a.model != "krea2":
+            fail(2, "bad_anypaint_model", "--anypaint 只有 krea2 支持",
+                 'imggen -m krea2 --anypaint 源图.png --rect X,Y,W,H "描述"')
+        if a.edit or a.inpaint:
+            fail(2, "bad_args",
+                 "--anypaint 与 --edit/--inpaint 不能同时使用",
+                 "--anypaint 用 AnyPaint 的 mask 约束，--inpaint 用低 denoise 重绘")
+        if a.rect and a.mask:
+            fail(2, "bad_args", "--rect 与 --mask 只能二选一",
+                 "--rect 给矩形，--mask 给任意形状的 mask 图")
+        if not a.rect and not a.mask:
+            fail(2, "bad_args",
+                 "--anypaint 需要 --rect 或 --mask 指定编辑区域",
+                 '例：--anypaint out.png --rect 600,500,400,450 "..."')
+        if a.anypaint_boundary < 0 or a.anypaint_ref_edge < 64:
+            fail(2, "bad_args", "AnyPaint 参数越界",
+                 "--anypaint-boundary ≥ 0，--anypaint-ref-edge ≥ 64")
     if a.inpaint:
         if a.rect and a.mask:
             fail(2, "bad_args", "--rect 与 --mask 只能二选一",
@@ -1368,7 +1522,11 @@ def main():
         ensure_service()
     a.loras = resolve_loras(a)
 
-    if a.inpaint:
+    if a.anypaint:
+        anypaint_src, anypaint_mask, anypaint_size = prepare_anypaint(a)
+        spec = anypaint_spec(a, anypaint_size)
+        preset, custom = "anypaint", True
+    elif a.inpaint:
         spec = refine_spec(a)
         preset, custom = "refine", True
     else:
@@ -1402,7 +1560,10 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         a.out = f"imggen_{a.model}_{ts}"
 
-    if a.inpaint:
+    if a.anypaint:
+        graph = build_anypaint_graph(a, spec, prompt, anypaint_src,
+                                     anypaint_mask)
+    elif a.inpaint:
         graph = build_refine_graph(a, spec, prompt, refine_src, refine_mask,
                                    refine_sample, refine_crop)
     else:
@@ -1414,6 +1575,12 @@ def main():
              "prompt_style": prompt_style,
              "supports_tags": a.mcfg.get("supports_tags", True),
              "spec": spec, "seed": a.seed, "graph": graph}
+        if a.anypaint:
+            d["anypaint"] = {"source": anypaint_src, "mask": anypaint_mask,
+                             "boundary": a.anypaint_boundary,
+                             "ref_edge": a.anypaint_ref_edge,
+                             "sr": a.anypaint_sr,
+                             "size": anypaint_size}
         if a.inpaint:
             lv = REFINE_LEVELS[a.refine_level]
             d["refine"] = {"level": a.refine_level, "name": lv["name"],
@@ -1600,6 +1767,10 @@ def main():
         "warnings": warnings,
         **({"refine": {"region": refine_crop, "denoise": spec["denoise"],
                        "source": refine_src}} if a.inpaint else {}),
+        **({"anypaint": {"source": anypaint_src, "mask": anypaint_mask,
+                         "boundary": a.anypaint_boundary,
+                         "ref_edge": a.anypaint_ref_edge,
+                         "sr": a.anypaint_sr}} if a.anypaint else {}),
     })
     lock.close()
     return 0
