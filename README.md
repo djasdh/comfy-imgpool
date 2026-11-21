@@ -85,6 +85,7 @@ imgpool status --id job_20261120_004606_abc123                # one job + prev/n
 imgpool result --id job_...                                  # result + prev/next
 imgpool wait --id job_...
 imgpool list --limit 20
+imgpool loras --model krea2                                   # LoRA catalog as JSON
 imgpool logs --id job_... --tail 50                          # this job's imggen output
 imgpool logs --pool                                          # pool-level events
 imgpool cancel --id job_... --source agent-a
@@ -441,7 +442,33 @@ Measured 17 s warm, 24 s cold, on the same 16 GB card. This refines detail; it
 does not invent missing structure. If the source face is already soft from a
 latent upscale, refine the 720p pass and then run the pixel two-pass.
 
-## Safety
+## LoRA catalog
+
+LoRA metadata lives in `loras/<model>.json`, one file per model. It is the single
+source for aliases, default strengths and descriptions; `imggen` falls back to its
+built-in aliases only when a file is missing.
+
+Each entry has `file`, `kind` (`functional` or `style`), `description`, `tags`,
+`aliases`, `default_strength`, `license`, `commercial_ok`, `source`, `tested`
+and `verified`. Role/character LoRAs are `style` with a `character` tag, so
+`functional` always means "tooling" (accelerate, edit, detail) and `style` means
+"what the picture looks like".
+
+```bash
+bin/lora-db list                      # all models, grouped by kind
+bin/lora-db list --model krea2        # one model
+bin/lora-db info thick                # full entry
+bin/lora-db audit                     # disk vs metadata: unregistered / missing / unverified
+bin/lora-db add new.safetensors --model krea2 --kind style --desc "..."
+bin/lora-db set thick --strength 0.6 --verified
+imgpool loras --model krea2           # same data as one-line JSON
+```
+
+`audit` compares the catalog against `ComfyUI/models/loras`. Unverified entries
+are the ones that only have a filename so far — they are deliberately not given
+invented weights or descriptions.
+
+
 
 - Both tools bind only to `127.0.0.1` by default. `IMGPOOL_BIND` can expose one
   interface; when you do that, set `IMGPOOL_TOKEN` (see

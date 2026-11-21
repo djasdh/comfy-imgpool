@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "model": "anima",
+  "display": "Anima",
+  "updated": "2026-11-21",
+  "loras": [
+    {
+      "file": "anima-turbo-lora-v0.2.safetensors",
+      "kind": "functional",
+      "description": "Anima 加速 LoRA v0.2：低步数采样，用于替代或配合 fast 预设。",
+      "tags": ["accelerate"],
+      "aliases": [],
+      "default_strength": 1.0,
+      "recommended": "1.0",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": true
+    },
+    {
+      "file": "betanonbeet_anima.safetensors",
+      "kind": "style",
+      "description": "蔚蓝档案角色主题 LoRA（训练标签含 serika、animal ears 等），用于 Anima 模型。",
+      "tags": ["character", "blue-archive", "animal-ears"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": false
+    }
+  ]
+}

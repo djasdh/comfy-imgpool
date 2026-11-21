@@ -1,0 +1,219 @@
+{
+  "schema": 1,
+  "model": "krea2",
+  "display": "Krea 2",
+  "updated": "2026-11-21",
+  "loras": [
+    {
+      "file": "krea2_style_magful.safetensors",
+      "kind": "style",
+      "description": "厚涂商业立绘风格：笔触更重，材质对比和面部体积更强；单用时整体偏写实。",
+      "tags": ["thick-paint", "commercial", "portrait"],
+      "aliases": ["thick"],
+      "default_strength": 1.0,
+      "recommended": "thick:0.6 + ra:0.4 + ur:0.3",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [
+        "2026-11-21：与 ra:0.4 + ur:0.3 组合用于樱花逆光人像，商业立绘质感最稳。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "krea2_realanime_semireal_v1.safetensors",
+      "kind": "style",
+      "description": "半写实动漫风格：保留二次元脸型，皮肤和光影向摄影靠拢。",
+      "tags": ["semi-real", "anime", "portrait"],
+      "aliases": ["ra"],
+      "default_strength": 0.8,
+      "recommended": "ra:0.4（与 thick 组合时）",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [
+        "2026-11-21：与 thick/ur 组合使用，0.4 左右保留线稿且提升皮肤质感。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "krea2_ultrareal_v2.safetensors",
+      "kind": "style",
+      "description": "写实化：加强皮肤质感、真实光照和背景摄影感；权重过高会压掉二次元线条。",
+      "tags": ["realism", "photographic", "portrait"],
+      "aliases": ["ur"],
+      "default_strength": 0.5,
+      "recommended": "ur:0.3（组合）/ ur:0.5（单独）",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/2462105",
+      "tested": [
+        "2026-11-21：0.3–0.5 用于商业立绘组合；0.5 单独使用仍保留线稿。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "krea2_real_scene_anime_v1.safetensors",
+      "kind": "style",
+      "description": "动漫人物 + 实景背景：人物保持二次元，环境向真实摄影靠拢。",
+      "tags": ["anime", "real-background", "cinematic"],
+      "aliases": ["rs"],
+      "default_strength": 0.6,
+      "recommended": "rs:0.6",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [
+        "2026-11-21：加入别名 rs，默认 0.6；未做系统扫描。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "BArtstyle-KREA2-V2-1024.safetensors",
+      "kind": "style",
+      "description": "蔚蓝档案（Blue Archive）画风：平涂、干净线稿、高饱和。",
+      "tags": ["blue-archive", "flat-color", "cel-shading"],
+      "aliases": ["ba2"],
+      "default_strength": 0.8,
+      "recommended": "ba2:0.8",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/29215",
+      "tested": [],
+      "verified": true
+    },
+    {
+      "file": "betanon_krea2_3000.safetensors",
+      "kind": "style",
+      "description": "betanon 画风（krea2 3000 步版本）；推荐权重和具体风格差异待核实。",
+      "tags": ["artist-style"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/2821198",
+      "tested": [],
+      "verified": false
+    },
+    {
+      "file": "betanon_krea2_e22.safetensors",
+      "kind": "style",
+      "description": "betanon 画风（krea2 e22 版本，LyCORIS 格式）；与 3000 步版本的差异待核实。",
+      "tags": ["artist-style", "lycoris"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": false
+    },
+    {
+      "file": "krea2_carapace777_v1.safetensors",
+      "kind": "style",
+      "description": "carapace777 风格 LoRA，内部标题 XIBALBA；主题与推荐权重待核实。",
+      "tags": ["artist-style", "unverified"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": false
+    },
+    {
+      "file": "zzz_krea2_5000.safetensors",
+      "kind": "style",
+      "description": "ZZZ 主题 LoRA（krea2 5000 步）；训练标签含 3Zgame，疑似绝区零相关，待核实。",
+      "tags": ["zzz", "game-style", "unverified"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": false
+    },
+    {
+      "file": "krea2_detail_slider.safetensors",
+      "kind": "functional",
+      "description": "细节滑块：正向权重提高细节密度。实测在本地 Krea2 int4 链路的低 denoise 二采段几乎无效。",
+      "tags": ["slider", "detail"],
+      "aliases": ["detail"],
+      "default_strength": 1.0,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/2729908",
+      "tested": [
+        "2026-11-21：二采 d0.12/0.18/0.22/0.25 与 d0.35–0.45 均无可测差异（mean diff 差 <0.1）。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "krea2_Enhancer.safetensors",
+      "kind": "functional",
+      "description": "成片增强：清理细节、锐化纹理、改善光照和整体完成度，作者称不改变提示词风格。",
+      "tags": ["enhance", "detail", "finish"],
+      "aliases": ["enh"],
+      "default_strength": 0.8,
+      "recommended": "enh:0.8",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/2730896",
+      "tested": [
+        "2026-11-21：下载后未完成有效对比（首次文件截断，重下后未复测）。"
+      ],
+      "verified": false
+    },
+    {
+      "file": "krea2_general_edit_v2.safetensors",
+      "kind": "functional",
+      "description": "参考图编辑 LoRA（reference-capable）：为 Krea2 提供 reference latent 通道，用于图生图、局部重绘和分块重绘的参考约束。",
+      "tags": ["edit", "reference", "img2img"],
+      "aliases": ["edit"],
+      "default_strength": 1.0,
+      "recommended": "edit:1.0",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [
+        "2026-11-21：comfyui-krea2edit 节点与 reference 路径使用该 LoRA。"
+      ],
+      "verified": true
+    },
+    {
+      "file": "shinler_detail_v10.safetensors",
+      "kind": "functional",
+      "description": "细节/对比/光照增强，偏动漫插画；也能提升提示词贴合度。",
+      "tags": ["detail", "anime", "contrast"],
+      "aliases": ["shinler"],
+      "default_strength": 0.8,
+      "recommended": "shinler:0.7（局部重生）/ 0.8（首采）",
+      "trigger": "sh1nstyl3",
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/3045076",
+      "tested": [
+        "2026-11-21：局部重生 d0.45 下 0.7 有可见增益（虹膜高光、皮肤纹理），1.0 开始出现散落白点。"
+      ],
+      "verified": true
+    }
+  ]
+}

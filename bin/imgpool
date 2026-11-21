@@ -1271,6 +1271,28 @@ def cmd_list(a):
     return 0
 
 
+def cmd_loras(a):
+    """列出或审计 LoRA 清单：转发 lora-db，保持一行 JSON 输出。"""
+    exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "lora-db")
+    args = [sys.executable, exe, "audit" if a.audit else "list", "--json"]
+    if a.model:
+        args += ["--model", a.model]
+    if a.kind:
+        args += ["--kind", a.kind]
+    p = subprocess.run(args, capture_output=True, text=True)
+    if p.returncode != 0:
+        emit({"ok": False, "error": "lora_db_failed",
+              "message": (p.stderr or p.stdout).strip()[:800]})
+        return p.returncode
+    try:
+        emit(json.loads(p.stdout))
+    except Exception:
+        emit({"ok": False, "error": "bad_lora_db_output",
+              "message": p.stdout[:800]})
+        return 5
+    return 0
+
+
 def cmd_logs(a):
     if a.pool:
         emit({"ok": True, "pool_log": POOL_LOG, "tail": _tail(POOL_LOG, a.tail)})
@@ -1448,6 +1470,11 @@ def build_parser():
     p = sub.add_parser("list", help="列出最近任务")
     p.add_argument("--limit", type=int, default=20)
 
+    p = sub.add_parser("loras", help="列出/审计 LoRA 清单（转发 lora-db）")
+    p.add_argument("--model")
+    p.add_argument("--kind", choices=("functional", "style"))
+    p.add_argument("--audit", action="store_true")
+
     p = sub.add_parser("logs", help="看日志")
     p.add_argument("--id")
     p.add_argument("--pool", action="store_true")
@@ -1476,6 +1503,8 @@ def main():
         return cmd_result(a)
     if a.cmd == "list":
         return cmd_list(a)
+    if a.cmd == "loras":
+        return cmd_loras(a)
     if a.cmd == "logs":
         return cmd_logs(a)
     if a.cmd == "cancel":

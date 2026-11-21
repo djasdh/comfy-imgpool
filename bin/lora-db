@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""lora-db — 按模型维护 LoRA 清单（功能 / 风格 + 描述）。
+
+  lora-db list                        # 所有模型，按 functional/style 分组
+  lora-db list --model krea2          # 只看一个模型
+  lora-db list --kind style --json    # 机器可读
+  lora-db info thick                  # 单条详情（别名或文件名）
+  lora-db audit                       # 对比磁盘，找未登记/缺失/未验证
+  lora-db add FILE --model krea2 --kind style --desc "..."
+  lora-db set heavy --desc "..." --strength 0.6 --verified
+  lora-db remove heavy --model krea2
+  lora-db render                      # 生成 Markdown 表
+
+元数据在仓库的 loras/<model>.json；磁盘目录由 COMFY_DIR / COMFY_LORA_DIR
+或从当前目录向上查找 ComfyUI/models/loras 决定。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _lora_meta as M
+
+
+def emit(obj, code=0):
+    print(json.dumps(obj, ensure_ascii=False, indent=2))
+    return code
+
+
+def fail(msg, code=2, hint=None):
+    d = {"ok": False, "error": msg}
+    if hint:
+        d["hint"] = hint
+    emit(d, code)
+    return code
+
+
+def find_loras_dir():
+    env = os.environ.get("COMFY_LORA_DIR")
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    for key in ("COMFY_DIR",):
+        v = os.environ.get(key)
+        if v:
+            p = os.path.join(os.path.abspath(os.path.expanduser(v)),
+                             "models", "loras")
+            if os.path.isdir(p):
+                return p
+    root = os.environ.get("COMFY_ROOT")
+    if root:
+        p = os.path.join(os.path.abspath(os.path.expanduser(root)),
+                         "ComfyUI", "models", "loras")
+        if os.path.isdir(p):
+            return p
+    for base in (os.getcwd(),
+                 os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):
+        d = base
+        for _ in range(6):
+            p = os.path.join(d, "ComfyUI", "models", "loras")
+            if os.path.isdir(p):
+                return p
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+    return None
+
+
+def disk_names():
+    p = find_loras_dir()
+    if not p:
+        return None
+    return sorted(f for f in os.listdir(p) if f.lower().endswith(
+        (".safetensors", ".pt", ".ckpt")))
+
+
+def fmt_alias(e):
+    a = e.get("aliases") or []
+    return ",".join(a) if a else "-"
+
+
+def fmt_row(e):
+    mark = "✔" if e.get("verified") else "?"
+    s = e.get("default_strength")
+    strength = "-" if s is None else f"{s:g}"
+    desc = (e.get("description") or "").replace("\n", " ")
+    return (f"  {mark} {e['file']:<46} {strength:>4}  "
+            f"{fmt_alias(e):<16} {desc}")
+
+
+def cmd_list(a):
+    data = M.load_all()
+    if a.model:
+        if a.model not in data:
+            return fail(f"没有模型 {a.model}", hint="可用：" +
+                        ", ".join(sorted(data)))
+        data = {a.model: data[a.model]}
+    if not data:
+        return fail("loras/ 目录里没有元数据文件", hint=str(M.LORA_DIR))
+
+    groups = {}
+    for model, d in data.items():
+        g = {"functional": [], "style": []}
+        for e in d.get("loras", []):
+            if a.kind and e.get("kind") != a.kind:
+                continue
+            g.setdefault(e.get("kind"), []).append(e)
+        groups[model] = {
+            "display": d.get("display", model),
+            "groups": g,
+        }
+
+    if a.json:
+        return emit({"ok": True, "loras_dir": M.LORA_DIR,
+                     "models": groups}, 0)
+
+    for model, item in groups.items():
+        total = sum(len(v) for v in item["groups"].values())
+        if total == 0:
+            continue
+        print(f"{model} ({item['display']}) — {total} 条")
+        for kind in M.KINDS:
+            rows = item["groups"].get(kind) or []
+            if not rows:
+                continue
+            print(f"  [{kind}]")
+            for e in rows:
+                print(fmt_row(e))
+        print()
+    print("✔ 已验证  ? 待核实")
+    return 0
+
+
+def cmd_info(a):
+    hit = M.find(a.name)
+    if not hit:
+        return fail(f"没有找到 {a.name}", hint="lora-db list 查看全部")
+    model, e = hit
+    if a.json:
+        return emit({"ok": True, "model": model, "lora": e}, 0)
+    print(f"{e['file']}")
+    print(f"  model        {model}")
+    print(f"  kind         {e.get('kind')}")
+    print(f"  aliases      {fmt_alias(e)}")
+    print(f"  strength     {e.get('default_strength')}")
+    print(f"  recommended  {e.get('recommended')}")
+    print(f"  trigger      {e.get('trigger')}")
+    print(f"  license      {e.get('license')}  commercial_ok={e.get('commercial_ok')}")
+    print(f"  source       {e.get('source')}")
+    print(f"  verified     {e.get('verified')}")
+    print(f"  description  {e.get('description')}")
+    for t in e.get("tested") or []:
+        print(f"  tested       {t}")
+    return 0
+
+
+def cmd_audit(a):
+    disk = disk_names()
+    if disk is None and not a.no_disk:
+        return fail("找不到 ComfyUI/models/loras",
+                    hint="设置 COMFY_LORA_DIR 或 COMFY_DIR，"
+                         "或加 --no-disk 只看元数据")
+    rep = M.audit(disk or [])
+    if a.json:
+        rep["ok"] = True
+        rep["disk_dir"] = find_loras_dir()
+        return emit(rep, 0)
+    print(f"磁盘目录  {find_loras_dir() or '(未检查)'}")
+    print(f"磁盘文件  {rep['disk']}   已登记  {rep['registered']}")
+    if rep["unregistered"]:
+        print(f"\n未登记（{len(rep['unregistered'])}）：")
+        for n in rep["unregistered"]:
+            print(f"  - {n}")
+    if rep["missing"]:
+        print(f"\n登记了但磁盘没有（{len(rep['missing'])}）：")
+        for n in rep["missing"]:
+            print(f"  - {n}")
+    if rep["duplicate"]:
+        print(f"\n重复登记（{len(rep['duplicate'])}）：")
+        for n, models in rep["duplicate"].items():
+            print(f"  - {n}: {', '.join(models)}")
+    if rep["unverified"]:
+        print(f"\n待核实（{len(rep['unverified'])}）：")
+        for u in rep["unverified"]:
+            print(f"  - [{u['model']}] {u['file']}")
+    if not any(rep[k] for k in
+               ("unregistered", "missing", "duplicate", "unverified")):
+        print("\n全部已登记且已验证。")
+    return 0
+
+
+def build_entry(a):
+    return {
+        "file": a.file,
+        "kind": a.kind,
+        "description": a.desc or "待补充",
+        "tags": [x for x in (a.tags or "").split(",") if x],
+        "aliases": [x for x in (a.alias or []) if x],
+        "default_strength": a.strength,
+        "recommended": a.recommended,
+        "trigger": a.trigger,
+        "license": a.license,
+        "commercial_ok": a.commercial_ok,
+        "source": a.source,
+        "tested": [x for x in (a.tested or []) if x],
+        "verified": bool(a.verified),
+    }
+
+
+def cmd_add(a):
+    try:
+        p = M.add_entry(a.model, build_entry(a))
+    except M.LoraMetaError as e:
+        return fail(str(e))
+    return emit({"ok": True, "written": p, "file": a.file})
+
+
+def cmd_set(a):
+    changes = {}
+    if a.desc is not None:
+        changes["description"] = a.desc
+    if a.kind is not None:
+        changes["kind"] = a.kind
+    if a.strength is not None:
+        changes["default_strength"] = a.strength
+    if a.tested:
+        changes["tested"] = a.tested
+    if a.trigger is not None:
+        changes["trigger"] = a.trigger
+    if a.source is not None:
+        changes["source"] = a.source
+    if a.license is not None:
+        changes["license"] = a.license
+    if a.verified:
+        changes["verified"] = True
+    if a.unverified:
+        changes["verified"] = False
+    if a.tags is not None:
+        changes["tags"] = [x for x in a.tags.split(",") if x]
+    if a.recommended is not None:
+        changes["recommended"] = a.recommended
+    if a.commercial_ok is not None:
+        changes["commercial_ok"] = a.commercial_ok
+
+    try:
+        data = M.load_model(a.model) if a.model else None
+        if data is not None:
+            target = (a.model, a.name)
+        else:
+            hit = M.find(a.name)
+            if not hit:
+                return fail(f"没有找到 {a.name}")
+            target = hit
+
+        if a.add_alias or a.remove_alias:
+            _, e = target
+            aliases = list(e.get("aliases") or [])
+            for x in a.add_alias or []:
+                if x not in aliases:
+                    aliases.append(x)
+            for x in a.remove_alias or []:
+                aliases = [y for y in aliases if y != x]
+            changes["aliases"] = aliases
+
+        if not changes:
+            return fail("没有要修改的字段")
+        p = M.update_entry(target[0], a.name, changes)
+    except M.LoraMetaError as e:
+        return fail(str(e))
+    return emit({"ok": True, "model": target[0], "written": p})
+
+
+def cmd_remove(a):
+    try:
+        if a.model:
+            p = M.remove_entry(a.model, a.name)
+        else:
+            hit = M.find(a.name)
+            if not hit:
+                return fail(f"没有找到 {a.name}")
+            p = M.remove_entry(hit[0], a.name)
+            a.model = hit[0]
+    except M.LoraMetaError as e:
+        return fail(str(e))
+    return emit({"ok": True, "model": a.model, "written": p,
+                 "removed": a.name})
+
+
+def cmd_render(a):
+    data = M.load_all()
+    if a.model:
+        data = {a.model: data[a.model]} if a.model in data else {}
+        if not data:
+            return fail(f"没有模型 {a.model}")
+    for model, d in data.items():
+        print(f"### {model} — {d.get('display', model)}\n")
+        print("| LoRA | 分类 | 别名 | 权重 | 说明 |")
+        print("|---|---|---|---|---|")
+        for e in d.get("loras", []):
+            desc = (e.get("description") or "").replace("\n", " ")
+            desc = desc.replace("|", "\\|")
+            print(f"| `{e['file']}` | {e.get('kind')} | "
+                  f"{fmt_alias(e)} | {e.get('default_strength') or '-'} | "
+                  f"{desc} |")
+        print()
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="lora-db", description="按模型维护 LoRA 清单")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("list", help="列出 LoRA")
+    p.add_argument("--model")
+    p.add_argument("--kind", choices=M.KINDS)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("info", help="单条详情")
+    p.add_argument("name")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("audit", help="对比磁盘与元数据")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--no-disk", action="store_true")
+    p.set_defaults(func=cmd_audit)
+
+    p = sub.add_parser("add", help="新增一条")
+    p.add_argument("file")
+    p.add_argument("--model", required=True)
+    p.add_argument("--kind", required=True, choices=M.KINDS)
+    p.add_argument("--desc")
+    p.add_argument("--tags", help="逗号分隔")
+    p.add_argument("--alias", action="append")
+    p.add_argument("--strength", type=float)
+    p.add_argument("--recommended")
+    p.add_argument("--trigger")
+    p.add_argument("--license", default="unknown")
+    p.add_argument("--commercial-ok", dest="commercial_ok",
+                   type=lambda v: v.lower() in ("1", "true", "yes"))
+    p.add_argument("--source")
+    p.add_argument("--tested", action="append")
+    p.add_argument("--verified", action="store_true")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("set", help="修改一条")
+    p.add_argument("name")
+    p.add_argument("--model")
+    p.add_argument("--desc")
+    p.add_argument("--kind", choices=M.KINDS)
+    p.add_argument("--strength", type=float)
+    p.add_argument("--tags")
+    p.add_argument("--recommended")
+    p.add_argument("--trigger")
+    p.add_argument("--source")
+    p.add_argument("--license")
+    p.add_argument("--commercial-ok", dest="commercial_ok",
+                   type=lambda v: v.lower() in ("1", "true", "yes"))
+    p.add_argument("--tested", action="append")
+    p.add_argument("--add-alias", action="append")
+    p.add_argument("--remove-alias", action="append")
+    p.add_argument("--verified", action="store_true")
+    p.add_argument("--unverified", action="store_true")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("remove", help="删除一条")
+    p.add_argument("name")
+    p.add_argument("--model")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("render", help="生成 Markdown 表")
+    p.add_argument("--model")
+    p.set_defaults(func=cmd_render)
+
+    return ap
+
+
+def main():
+    a = build_parser().parse_args()
+    try:
+        return a.func(a)
+    except M.LoraMetaError as e:
+        return fail(str(e))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

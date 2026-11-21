@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "model": "minimax",
+  "display": "MiniMax H3",
+  "updated": "2026-11-21",
+  "loras": [
+    {
+      "file": "minimax_h3_turbo_4步加速_comfyui.safetensors",
+      "kind": "functional",
+      "description": "MiniMax H3 turbo 4 步加速 LoRA。",
+      "tags": ["accelerate"],
+      "aliases": [],
+      "default_strength": 1.0,
+      "recommended": "1.0",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [],
+      "verified": true
+    }
+  ]
+}

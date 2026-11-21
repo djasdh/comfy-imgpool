@@ -39,6 +39,13 @@ import urllib.request
 import uuid
 from datetime import datetime
 
+# LoRA 元数据（loras/<model>.json）。缺失时 imggen 仍按内置别名工作。
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+try:
+    import _lora_meta as LORA_META
+except Exception:  # pragma: no cover - 元数据损坏不应阻断出图
+    LORA_META = None
+
 def _find_comfy_root():
     """定位 ComfyUI 项目根目录：COMFY_ROOT > 向上查找含 ComfyUI/ 的目录。"""
     env = os.environ.get("COMFY_ROOT")
@@ -263,8 +270,9 @@ MODELS = {
 DEFAULT_MODEL = "moss"
 DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
 
-# LoRA 别名 -> (文件名, 默认强度)。写 --lora ba 即等于 ba_style_moss_v09:0.8
-LORA_ALIASES = {
+# 内置 LoRA 别名 -> (文件名, 默认强度)，作为 loras/*.json 缺失时的兜底。
+# 正常路径由 _lora_meta 提供，见 LORA_ALIASES。
+BUILTIN_LORA_ALIASES = {
     "ba": ("ba_style_moss_v09.safetensors", 0.8),
     "zzz": ("zzz_anireal_moss_v1.safetensors", 1.5),
     "ba2": ("BArtstyle-KREA2-V2-1024.safetensors", 0.8),
@@ -275,7 +283,58 @@ LORA_ALIASES = {
     "rs": ("krea2_real_scene_anime_v1.safetensors", 0.6),
     "ur": ("krea2_ultrareal_v2.safetensors", 0.5),
 }
-LORA_DEFAULTS = {v[0]: v[1] for v in LORA_ALIASES.values()}
+
+
+def _load_lora_aliases():
+    """元数据优先，内置兜底。返回 {alias: (file, strength)}。"""
+    out = dict(BUILTIN_LORA_ALIASES)
+    if LORA_META is None:
+        return out
+    try:
+        for alias, (file, strength, _model) in LORA_META.alias_map().items():
+            out[alias] = (file, strength)
+    except Exception:
+        pass
+    return out
+
+
+LORA_ALIASES = _load_lora_aliases()
+LORA_DEFAULTS = {v[0]: v[1] for v in LORA_ALIASES.values()
+                 if v[1] is not None}
+
+
+def lora_groups():
+    """按模型 + functional/style 分组的 LoRA 元数据，供 --list 使用。"""
+    if LORA_META is None:
+        return {}
+    out = {}
+    try:
+        for model, data in LORA_META.load_all().items():
+            g = {"functional": [], "style": []}
+            for e in data.get("loras", []):
+                g.setdefault(e.get("kind"), []).append({
+                    "file": e.get("file"),
+                    "description": e.get("description"),
+                    "aliases": e.get("aliases") or [],
+                    "default_strength": e.get("default_strength"),
+                    "verified": e.get("verified", False),
+                })
+            out[model] = g
+    except Exception:
+        return {}
+    return out
+
+
+def lora_owner(name, model):
+    """返回该 LoRA 登记在哪个模型；未登记返回 None。"""
+    if LORA_META is None:
+        return None
+    try:
+        hit = LORA_META.find(name)
+    except Exception:
+        return None
+    return hit[0] if hit else None
+
 
 
 # ----------------------------------------------------------------------------
@@ -957,6 +1016,9 @@ def resolve_loras(a):
             else:
                 fail(2, "unknown_lora", f"LoRA 不存在：{name}",
                      "可用：" + ", ".join(names))
+        owner = lora_owner(name, a.model)
+        if owner and owner != a.model:
+            log(f"[imggen] 警告：{name} 登记在 {owner}，当前模型是 {a.model}")
         if strength is None:
             strength = LORA_DEFAULTS.get(name, a.lora_strength)
         out.append((name, strength))
@@ -1113,6 +1175,7 @@ def do_list():
         "loras": loras,
         "lora_aliases": {k: {"file": v[0], "strength": v[1]}
                          for k, v in LORA_ALIASES.items()},
+        "lora_groups": lora_groups(),
         "usage": [
             'imggen "提示词"',
             'imggen -m anima "提示词"',

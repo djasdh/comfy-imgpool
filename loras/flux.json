@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "model": "flux",
+  "display": "FLUX.1 dev",
+  "updated": "2026-11-21",
+  "loras": [
+    {
+      "file": "modern-anime-lora.safetensors",
+      "kind": "style",
+      "description": "现代动漫风格。实际架构是 FLUX.1-dev（文件 metadata: flux-1-dev/lora），imggen 当前的 moss/anima/krea2 链路都无法加载它。",
+      "tags": ["anime", "flux", "unused"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": [
+        "2026-11-21：读取 safetensors metadata 确认为 flux-1-dev/lora，不属于本地任何可用模型。"
+      ],
+      "verified": true
+    }
+  ]
+}

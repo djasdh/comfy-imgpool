@@ -1,0 +1,83 @@
+{
+  "schema": 1,
+  "model": "moss",
+  "display": "MOSS Image",
+  "updated": "2026-11-21",
+  "loras": [
+    {
+      "file": "moss_image_sft_4step_v2.0.safetensors",
+      "kind": "functional",
+      "description": "MOSS 4 步加速 LoRA（SFT v2.0）：把采样压到 4 步，imggen 的 moss 默认加载它。",
+      "tags": ["accelerate", "default"],
+      "aliases": [],
+      "default_strength": 1.0,
+      "recommended": "1.0（imggen 默认）",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": ["imggen 的 moss 预设默认使用，4 步出图。"],
+      "verified": true
+    },
+    {
+      "file": "moss_image_edit_lora_rank_64_bf16.safetensors",
+      "kind": "functional",
+      "description": "MOSS 图像编辑 LoRA：提供参考图编辑能力，imggen 的 --edit 依赖它。",
+      "tags": ["edit", "reference", "img2img"],
+      "aliases": [],
+      "default_strength": 1.0,
+      "recommended": "1.0（--edit 时自动加载）",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": null,
+      "tested": ["imggen -m moss --edit 会自动挂载。"],
+      "verified": true
+    },
+    {
+      "file": "ba_style_moss_v09.safetensors",
+      "kind": "style",
+      "description": "蔚蓝档案画风（MOSS 版 v0.9）：平涂、干净线稿、高饱和。",
+      "tags": ["blue-archive", "flat-color", "cel-shading"],
+      "aliases": ["ba"],
+      "default_strength": 0.8,
+      "recommended": "ba:0.8",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/3047401",
+      "tested": [],
+      "verified": true
+    },
+    {
+      "file": "zzz_anireal_moss_v1.safetensors",
+      "kind": "style",
+      "description": "动漫写实风格（Anireal，MOSS v1）：二次元角色 + 写实光影和皮肤。",
+      "tags": ["anime-realism", "portrait"],
+      "aliases": ["zzz"],
+      "default_strength": 1.5,
+      "recommended": "zzz:1.5",
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/3006790",
+      "tested": [],
+      "verified": true
+    },
+    {
+      "file": "moss-mixdark_lora_e32.safetensors",
+      "kind": "style",
+      "description": "Mixdark 暗调风格（MOSS，e32）；具体效果和推荐权重待核实。",
+      "tags": ["dark", "moody", "unverified"],
+      "aliases": [],
+      "default_strength": null,
+      "recommended": null,
+      "trigger": null,
+      "license": "unknown",
+      "commercial_ok": null,
+      "source": "https://civitai.com/models/3013357",
+      "tested": [],
+      "verified": false
+    }
+  ]
+}
