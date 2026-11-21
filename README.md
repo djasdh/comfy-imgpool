@@ -396,8 +396,25 @@ back through a feathered mask.
 ```bash
 imggen -m krea2 --inpaint out.png --rect 600,500,400,450 "detailed face"
 imggen -m krea2 --inpaint out.png --mask mask.png "detailed face"
-imggen -m krea2 --inpaint out.png --rect ... --refine-denoise 0.20 --no-refine-sr ...
+imggen -m krea2 --inpaint out.png --rect ... --refine-level 3 "detailed face"
+imggen -m krea2 --inpaint out.png --rect ... --refine-level 3 \
+  --refine-denoise 0.40 --no-refine-sr ...
 ```
+
+`--refine-level` picks one of four presets; the individual flags still override
+any single value:
+
+| level | denoise | long edge | what it does |
+|---|---|---|---|
+| 1 `integrate` | 0.12 | 1024 | folds SR detail back in, footprint unchanged |
+| 2 `light` | 0.35 | 1024 | cleans SR noise, lines slightly crisper |
+| 3 `detail` | 0.45 | 1024 | visible new detail: iris layers, lashes, petal volume |
+| 4 `strong` | 0.55 | 1024 | strongest; facial features may shift a little |
+
+The jump from 1 to 3 is not a sharper version of the same pixels. A 380×340
+face cropped and regenerated at 1024 gives each token ~1/7 of the source area,
+so the model has to draw rather than resample — measured mean diff 10–17 inside
+the region while every pixel outside stays bit-identical.
 
 Krea 2 has no inpaint weights, so this is the training-free route the community
 uses: `SetLatentNoiseMask` restricts sampling to the mask, which keeps everything
@@ -410,14 +427,15 @@ What the defaults mean:
   produce the same crop; the mask version keeps a hand-drawn shape.
 - `--refine-pad 64` adds context around the region. Without context the model
   has no idea what the crop belongs to.
-- `--refine-long-edge 1024` sets the generation size. Krea 2 is trained at
-  ≤2 MP, so a 300 px face does not get more detail from a 2K canvas.
 - `--no-refine-sr` skips the AnimeSharp 2× pre-upscale. Keep it on: the SR
   input is sharper, so the sampler has to invent less and the face moves less.
-- `--refine-denoise 0.12` is the safe value. Measured on a 1536² anime portrait:
-  0.12 changes almost nothing, 0.15 slightly enlarges the eyes, 0.30 visibly
-  restages the face. Raise it only when you actually want new content in the
-  region (0.5+ for background replacement).
+- `--refine-denoise` is set by the preset. Level 1 (0.12) changes almost
+  nothing, 0.15 slightly enlarges the eyes, 0.30 visibly restages the face.
+  Override it only when you want to sit between two presets.
+- `--refine-long-edge` sets the generation size. Krea 2 is trained at ≤2 MP,
+  so a 300 px face does not get more detail from a 2K canvas. Beyond 1024 the
+  model starts hallucinating texture: on anime skin, 1536 produced scattered
+  brown specks. 1024 is the sweet spot for a face-sized crop.
 
 Measured 17 s warm, 24 s cold, on the same 16 GB card. This refines detail; it
 does not invent missing structure. If the source face is already soft from a

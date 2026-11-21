@@ -1071,8 +1071,9 @@ def build_imggen_args(a, prompt):
     for name in ("seed", "preset", "variant", "size", "aspect", "width", "height", "steps", "steps2",
                  "cfg", "denoise", "denoise2", "scale", "out", "edit", "negative",
                  "lora_strength", "edit_strength", "queue_wait", "lock_wait",
-                 "inpaint", "rect", "mask", "refine_denoise", "refine_pad",
-                 "refine_long_edge", "refine_feather", "refine_sr_model"):
+                 "inpaint", "rect", "mask", "refine_level", "refine_denoise",
+                 "refine_pad", "refine_long_edge", "refine_feather",
+                 "refine_sr_model"):
         v = getattr(a, name, None)
         if v is None:
             continue
@@ -1414,6 +1415,8 @@ def build_parser():
     p.add_argument("--rect", help="重绘矩形 X,Y,W,H")
     p.add_argument("--mask", help="黑白 mask 图（白=重绘）")
     p.add_argument("--refine-denoise", type=float)
+    p.add_argument("--refine-level", type=int, choices=(1, 2, 3, 4),
+                   help="局部重绘强度档 1/2/3/4")
     p.add_argument("--refine-pad", type=int)
     p.add_argument("--refine-long-edge", type=int)
     p.add_argument("--refine-feather", type=int)

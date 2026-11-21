@@ -721,6 +721,33 @@ def resolve_variant(a):
     return cfg
 
 
+# 局部重绘的四档预设。每档只改 denoise 和 crop 的生成分辨率：
+# pad/feather 决定接缝，不决定细节量，四档保持一致。
+REFINE_LEVELS = {
+    1: {"name": "integrate", "denoise": 0.12, "long_edge": 1024,
+        "pad": 64, "feather": 32},
+    2: {"name": "light", "denoise": 0.35, "long_edge": 1024,
+        "pad": 64, "feather": 32},
+    3: {"name": "detail", "denoise": 0.45, "long_edge": 1024,
+        "pad": 64, "feather": 32},
+    4: {"name": "strong", "denoise": 0.55, "long_edge": 1024,
+        "pad": 64, "feather": 32},
+}
+
+
+def apply_refine_level(a):
+    """把档位默认值填进未显式指定的 refine 参数。"""
+    lv = REFINE_LEVELS[a.refine_level]
+    if a.refine_denoise is None:
+        a.refine_denoise = lv["denoise"]
+    if a.refine_pad is None:
+        a.refine_pad = lv["pad"]
+    if a.refine_long_edge is None:
+        a.refine_long_edge = lv["long_edge"]
+    if a.refine_feather is None:
+        a.refine_feather = lv["feather"]
+
+
 def refine_spec(a):
     steps = a.steps or a.mcfg.get("custom_steps", 8)
     return dict(width=0, height=0, steps=steps,
@@ -1100,6 +1127,7 @@ def do_list():
             'imggen -m moss --allow-format-mismatch --prompt "1girl, solo"',
             'imggen --edit 图片路径 "编辑指令"',
             'imggen -m krea2 --inpaint 成片.png --rect 600,500,400,450 "描述"',
+            'imggen -m krea2 --inpaint 成片.png --rect 600,500,400,450 --refine-level 3 "描述"',
             'imggen -m krea2 --inpaint 成片.png --mask mask.png "描述"',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
@@ -1157,13 +1185,16 @@ def build_parser():
     ap.add_argument("--mask", metavar="IMAGE",
                     help="黑白 mask 图，白=重绘；与 --rect 互斥")
     ap.add_argument("--refine-denoise", type=float,
-                    help="局部重绘 denoise，默认 0.12（0.15 起会轻微改动五官）")
-    ap.add_argument("--refine-pad", type=int, default=64,
-                    help="crop 时保留的上下文像素，默认 64")
-    ap.add_argument("--refine-long-edge", type=int, default=1024,
-                    help="重绘区域的长边分辨率，默认 1024")
-    ap.add_argument("--refine-feather", type=int, default=32,
-                    help="贴回时的羽化像素，默认 32")
+                    help="局部重绘 denoise；默认由 --refine-level 决定")
+    ap.add_argument("--refine-level", type=int, default=1, choices=(1, 2, 3, 4),
+                    help="局部重绘强度档：1 收尾 / 2 轻修 / 3 细节 / 4 重绘"
+                         "（默认 1）")
+    ap.add_argument("--refine-pad", type=int, default=None,
+                    help="crop 时保留的上下文像素；默认由档位决定（64）")
+    ap.add_argument("--refine-long-edge", type=int, default=None,
+                    help="重绘区域的长边分辨率；默认由档位决定")
+    ap.add_argument("--refine-feather", type=int, default=None,
+                    help="贴回时的羽化像素；默认由档位决定（32）")
     ap.add_argument("--no-refine-sr", action="store_true",
                     help="不用 AnimeSharp 放大 crop（默认用，线条更稳）")
     ap.add_argument("--refine-sr-model", default="2x-AnimeSharpV2_RPLKSR_Sharp.pth")
@@ -1227,6 +1258,7 @@ def main():
         if not a.rect and not a.mask:
             fail(2, "bad_args", "--inpaint 需要 --rect 或 --mask 指定重绘区域",
                  '例：--inpaint out.png --rect 600,500,400,450 "..."')
+        apply_refine_level(a)
 
     # seed
     if str(a.seed).lower() in ("random", "rand", "r"):
@@ -1287,7 +1319,12 @@ def main():
              "supports_tags": a.mcfg.get("supports_tags", True),
              "spec": spec, "seed": a.seed, "graph": graph}
         if a.inpaint:
-            d["refine"] = {"source": refine_src, "mask": refine_mask,
+            lv = REFINE_LEVELS[a.refine_level]
+            d["refine"] = {"level": a.refine_level, "name": lv["name"],
+                           "denoise": a.refine_denoise,
+                           "long_edge": a.refine_long_edge,
+                           "pad": a.refine_pad, "feather": a.refine_feather,
+                           "source": refine_src, "mask": refine_mask,
                            "crop": refine_crop}
         emit(d)
         return 0
