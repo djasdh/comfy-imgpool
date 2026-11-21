@@ -337,8 +337,20 @@ save_file(dec, "models/vae_approx/taef2_decoder.safetensors")
 
 3. `imggen -m moss --preset 1280 "..."` (or `--vae taef2` on any run).
 
-Measured on the reference machine: 1280² two-pass is ~13s warm / ~24s cold,
-and PSNR against the full VAE decode is ~39.9 dB. Text rendering suffers from
+Both two-pass presets (`1280`, `1536-2pass`) now upscale in **pixel space** like
+Krea 2: decode the first pass, run `2x-AnimeSharpV2_RPLKSR_Sharp`, lanczos down
+to the target scale (0.625 for 1.25×, 0.75 for 1.5×), re-encode, then refine for
+4 steps. Latent interpolation at 1.25× leaves a double contour on lineart that a
+4-step distilled model cannot fold back into one edge; the SR model draws the
+line once and the low-denoise pass only integrates it. Measured Laplacian
+variance on the same seed: 411 (latent) → 774 (pixel). Pass `--latent` to get the
+old link back, which is the better choice for photoreal prompts where the anime
+SR sharpening looks wrong.
+
+TAEF2 is a 10 MB tiny autoencoder and must decode untiled: the pixel path uses
+plain `VAEDecode`/`VAEEncode` for MOSS, not the tiled variants Krea 2 uses.
+Measured 1280² two-pass is ~56 s cold / ~42 s warm with the extra SR, and PSNR
+against the full VAE decode is ~39.9 dB. Text rendering suffers from
 any second pass (`denoise2 > 0` repaints glyphs), so use single-pass 1024 for
 text-heavy prompts.
 

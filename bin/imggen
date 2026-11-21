@@ -126,16 +126,23 @@ MODELS = {
             "1024": dict(width=1024, height=1024, steps=4, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          est_seconds=9.0),
-            # 二采：1024 首采 -> 1280（1.25×，输出是 8 的倍数）
+            # 二采：1024 首采 -> 像素 2x SR -> 1280。latent 放大 1.25x 后 4 步
+            # 收敛不回来，二次元线稿会出现重影；像素链路先用 SR 把线条撑住。
             "1280": dict(width=1024, height=1024, steps=4, cfg=1.0,
                          sampler="euler", scheduler="simple", denoise=1.0,
                          two_pass=True, scale=1.25, steps2=4, denoise2=0.2,
-                         vae="taef2", est_seconds=None),
-            # 二采：1024 首采 -> 1536（1.5×，TAEF2 解码，冷启动约 40s）
+                         upscale_mode="pixel",
+                         upscale_model="2x-AnimeSharpV2_RPLKSR_Sharp.pth",
+                         upscale_ratio=2.0,
+                         vae="taef2", vae_tiled=False, est_seconds=None),
+            # 二采：1024 首采 -> 像素 2x SR -> 1536
             "1536-2pass": dict(width=1024, height=1024, steps=4, cfg=1.0,
                                sampler="euler", scheduler="simple", denoise=1.0,
                                two_pass=True, scale=1.5, steps2=4, denoise2=0.3,
-                               vae="taef2", est_seconds=None),
+                               upscale_mode="pixel",
+                               upscale_model="2x-AnimeSharpV2_RPLKSR_Sharp.pth",
+                               upscale_ratio=2.0,
+                               vae="taef2", vae_tiled=False, est_seconds=None),
         },
         "risky_presets": {
             "1536": dict(width=1536, height=1536, steps=4, cfg=1.0,
@@ -588,11 +595,14 @@ def build_graph(a, spec, prompt_text, edit_image):
             # 像素放大链路：解码 -> SR 模型 -> 缩到目标尺寸 -> 重新编码 -> 低 denoise 精修。
             # 二次元线稿必须走这条：latent 放大靠插值撑边，低步数二采收敛不回来。
             tile = spec.get("vae_tile_size", 512)
-            add(13, "VAEDecodeTiled", {
-                "samples": last, "vae": ["4", 0],
-                "tile_size": tile, "overlap": 64,
-                "temporal_size": 64, "temporal_overlap": 8,
-            })
+            if spec.get("vae_tiled", True):
+                add(13, "VAEDecodeTiled", {
+                    "samples": last, "vae": ["4", 0],
+                    "tile_size": tile, "overlap": 64,
+                    "temporal_size": 64, "temporal_overlap": 8,
+                })
+            else:
+                add(13, "VAEDecode", {"samples": last, "vae": ["4", 0]})
             add(14, "UpscaleModelLoader", {"model_name": spec["upscale_model"]})
             add(15, "ImageUpscaleWithModel", {
                 "upscale_model": ["14", 0], "image": ["13", 0],
@@ -601,11 +611,14 @@ def build_graph(a, spec, prompt_text, edit_image):
                 "image": ["15", 0], "upscale_method": "lanczos",
                 "scale_by": spec["scale"] / spec.get("upscale_ratio", 2.0),
             })
-            add(17, "VAEEncodeTiled", {
-                "pixels": ["16", 0], "vae": ["4", 0],
-                "tile_size": tile, "overlap": 64,
-                "temporal_size": 64, "temporal_overlap": 8,
-            })
+            if spec.get("vae_tiled", True):
+                add(17, "VAEEncodeTiled", {
+                    "pixels": ["16", 0], "vae": ["4", 0],
+                    "tile_size": tile, "overlap": 64,
+                    "temporal_size": 64, "temporal_overlap": 8,
+                })
+            else:
+                add(17, "VAEEncode", {"pixels": ["16", 0], "vae": ["4", 0]})
             add(10, "KSampler", {
                 "model": ["19", 0], "seed": seed, "steps": spec["steps2"],
                 "cfg": spec["cfg"], "sampler_name": spec["sampler"],
