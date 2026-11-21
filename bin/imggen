@@ -1038,10 +1038,72 @@ def anypaint_spec(a, size):
                 vae=a.vae or a.mcfg["vae"])
 
 
+def _two_pass_align(scale, out_align=16):
+    """首采对齐基数：align 是 16 的倍数，且 align×scale 是 out_align 的整数倍。
+
+    1.25 需要 64、1.5 需要 32、1.6 需要 80、2.0 只需要 16。
+    """
+    for align in range(16, 4096, 16):
+        out = align * scale
+        if abs(out - round(out)) < 1e-6 and int(round(out)) % out_align == 0:
+            return align
+    fail(2, "bad_scale_align",
+         f"scale {scale:g} 在 16 对齐网格上无法得到 {out_align} 对齐的输出",
+         "换一个 scale（如 1.5 / 1.6 / 2.0）")
+
+
+def _fit_aspect(spec, ra, rb):
+    """保持预设像素面积，按比例重算首采尺寸，并满足 VAE 对齐和单边上限。"""
+    area = spec["width"] * spec["height"]
+    align = 16
+    limit = 2048
+    if spec.get("two_pass"):
+        align = _two_pass_align(spec["scale"])
+        # 二采输出单边也要 ≤ 2048，首采上限相应收紧
+        limit = int(2048 / spec["scale"])
+    limit = max(align, int(limit / align) * align)
+
+    w = int(round(math.sqrt(area * ra / rb) / align)) * align
+    h = int(round(w * rb / ra / align)) * align
+    shrunk = False
+    if max(w, h) > limit:
+        k = limit / max(w, h)
+        w = max(align, int(w * k / align) * align)
+        h = max(align, int(round(w * rb / ra) / align) * align)
+        shrunk = True
+
+    if w < 64 or h < 64:
+        fail(2, "bad_aspect", f"{ra:g}:{rb:g} 在当前面积下算出的尺寸 {w}x{h} 太小",
+             "换一个更接近正方形的比例，或换更大的 preset")
+
+    actual = w * h
+    # 单边上限导致的缩面积是预期行为，不算比例误差
+    if not shrunk and abs(actual - area) / area > 0.10:
+        fail(2, "bad_aspect_area",
+             f"{ra:g}:{rb:g} 在 {align} 对齐下面积从 {area/1e6:.2f}MP "
+             f"变成 {actual/1e6:.2f}MP，偏差超过 10%",
+             "换一个比例，或直接用 --size 指定尺寸")
+
+    if spec.get("two_pass"):
+        ow, oh = w * spec["scale"], h * spec["scale"]
+        if (abs(ow - round(ow)) > 1e-6 or abs(oh - round(oh)) > 1e-6
+                or int(round(ow)) % 16 or int(round(oh)) % 16):
+            fail(2, "bad_aspect_scale",
+                 f"{ra:g}:{rb:g} × scale {spec['scale']:g} 的输出 "
+                 f"{ow:g}x{oh:g} 不是 16 的倍数",
+                 "换一个比例或 scale")
+
+    spec["width"], spec["height"] = w, h
+
+
 def resolve_spec(a):
     """返回 (spec, preset_name, custom)。--size/--width/--height 走单采。"""
     cfg = a.mcfg
     custom = a.size is not None or a.width is not None or a.height is not None
+
+    if custom and a.aspect:
+        fail(2, "bad_args", "--aspect 与 --size/--width/--height 不能同时使用",
+             "--size 直接给尺寸，--aspect 只给比例")
 
     if custom:
         if a.size:
@@ -1080,31 +1142,17 @@ def resolve_spec(a):
         avail = sorted(list(cfg["presets"]) + list(cfg.get("risky_presets", {})))
         fail(2, "bad_preset", f"{a.model} 没有预设 {preset!r}", f"可选：{', '.join(avail)}")
 
-    # --aspect：按比例重算首采尺寸。80 对齐 = LCM(16 像素对齐, 5)，
-    # 这样 scale 取 1.5/1.6/2.0 时二采输出一定是 8 的倍数（避免 1.4x 那种 VAE 慢速坑）。
+    # --aspect：保持预设面积，按比例重算首采尺寸（对齐和上限见 _fit_aspect）。
     if a.aspect:
-        if a.size:
-            fail(2, "bad_args", "--aspect 与 --size 不能同时使用",
-                 "--size 直接给尺寸，--aspect 只给比例")
-        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)", a.aspect.strip())
+        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)",
+                         a.aspect.strip())
         if not m:
             fail(2, "bad_aspect", f"--aspect 需要 W:H 格式，收到 {a.aspect!r}",
                  "例：--aspect 1:1 / 16:9 / 9:16 / 4:5 / 3:2")
         ra, rb = float(m.group(1)), float(m.group(2))
         if ra <= 0 or rb <= 0:
             fail(2, "bad_aspect", f"--aspect 的宽高必须大于 0：{a.aspect!r}")
-        area = spec["width"] * spec["height"]
-        w = max(480, int(round(math.sqrt(area * ra / rb) / 80.0)) * 80)
-        h = max(480, int(round(w * rb / ra / 80.0)) * 80)
-        spec["width"], spec["height"] = w, h
-        if spec.get("two_pass"):
-            ow, oh = w * spec["scale"], h * spec["scale"]
-            if (abs(ow - round(ow)) > 1e-6 or abs(oh - round(oh)) > 1e-6
-                    or int(round(ow)) % 8 or int(round(oh)) % 8):
-                fail(2, "bad_aspect_scale",
-                     f"{a.aspect} × scale {spec['scale']:g} 的输出 {ow:g}x{oh:g} "
-                     f"不是整数或不是 8 的倍数",
-                     "换 scale（1.5 / 1.6 / 2.0）或换比例")
+        _fit_aspect(spec, ra, rb)
 
     # --latent：二采回退到 latent 放大（krea2 的 2k 默认是像素放大链路）
     if spec.get("two_pass") and a.latent and spec.get("upscale_mode") == "pixel":

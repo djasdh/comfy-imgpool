@@ -377,11 +377,14 @@ licensed upscaler (and re-check the numbers — a 4× model also works but the
 
 `--aspect W:H` picks the composition instead of using the preset's shape, and
 the two-pass output keeps that ratio. It preserves the preset's pixel area and
-rounds the first pass to a multiple of 80 — the least common multiple of the
-16-pixel tile alignment and 5, which is what makes `scale 1.6` land on whole
-8-pixel output dimensions. So `1:1` becomes 960×960 → 1536×1536, `16:9` becomes
-1280×720 → 2048×1152, `4:5` becomes 880×1120 → 1408×1792. Combinations whose
-output is not a multiple of 8 are rejected up front (the 1.4× VAE trap).
+picks the smallest 16-pixel first-pass grid that makes the second pass land on
+whole 16-pixel dimensions: `scale 1.25` needs 64, `1.5` needs 32, `1.6` needs
+80, single-pass needs 16. So `krea2 2k --aspect 16:9` is 1280×720 → 2048×1152,
+`moss 1280 --aspect 1:1` is 1024×1024 → 1280×1280, and `2k-direct --aspect 9:16`
+is 1152×2048. When a ratio would push either the first pass or the two-pass
+output past 2048 px, the area is scaled down to fit (`2k-direct --aspect 21:9`
+→ 2048×864); ratios that would change the area by more than 10% on the 16-pixel
+grid are rejected up front.
 
 `krea2 --preset 2k-direct` samples 1152×2048 in a single pass at 8 steps. The
 prompt guides every step at full resolution instead of refining an upscaled
