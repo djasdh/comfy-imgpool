@@ -10,6 +10,7 @@
   imggen -m anima "提示词"                         # 1024→1536 二采，12 秒
   imggen -m krea2 --preset 2k "提示词"             # 1152×2048 二采，锁构图
   imggen -m krea2 --preset 2k-direct "提示词"      # 1152×2048 单采，细节更好
+  imggen -m krea2 --aspect 16:9 --native "提示词"  # 吸附到模型原生档位
   imggen -m moss --size 1024 "提示词"
   imggen -m anima --width 1344 --height 768 "提示词"   # 自定义尺寸走单采
   imggen -m krea2 --lora thick:0.8 "提示词"
@@ -110,6 +111,13 @@ MODELS = {
         "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors",
                  "type": "moss_image", "device": "default"},
         "vae": "flux2-vae.safetensors",
+        # MOSS model card 推荐的 1MP 档位（16 像素对齐，覆盖 4:1 到 1:4）。
+        "native_sizes": [
+            (512, 2048), (592, 1776), (720, 1456), (768, 1360),
+            (832, 1248), (880, 1184), (1024, 1024), (1184, 880),
+            (1248, 832), (1360, 768), (1456, 720), (1776, 592),
+            (2048, 512),
+        ],
         # MOSS 不认 fused_norm / fused_swiglu，只开 hip + int8_gemm
         "accel": {"backend": "hip", "transpose_weights": False,
                   "int8_gemm": True, "fused_norm": False, "fused_swiglu": False},
@@ -175,6 +183,12 @@ MODELS = {
         "clip": {"clip_name": "qwen_3_06b_base.safetensors",
                  "type": "stable_diffusion", "device": "default"},
         "vae": "qwen_image_vae.safetensors",
+        # Anima 的 1MP aspect buckets（1024² 基准，SDXL 风格分桶）。
+        "native_sizes": [
+            (1024, 1024), (1152, 896), (1216, 832), (1344, 768),
+            (1536, 640), (896, 1152), (832, 1216), (768, 1344),
+            (640, 1536),
+        ],
         # Anima 的 attention 走 SDPA，不经优化节点；只有 int8_gemm 生效
         "accel": {"backend": "hip", "transpose_weights": False,
                   "int8_gemm": True, "fused_norm": False, "fused_swiglu": False},
@@ -214,6 +228,12 @@ MODELS = {
         "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
                  "type": "krea2", "device": "default"},
         "vae": "qwen_image_vae.safetensors",
+        # Qwen-Image model card 的原生档位（1:1 / 16:9 / 9:16 / 4:3 /
+        # 3:4 / 3:2 / 2:3）；krea2 使用同一底模和 VAE。
+        "native_sizes": [
+            (1328, 1328), (1664, 928), (928, 1664), (1472, 1104),
+            (1104, 1472), (1584, 1056), (1056, 1584),
+        ],
         "accel": {"backend": "hip", "transpose_weights": False,
                   "int8_gemm": True, "fused_norm": True, "fused_swiglu": True},
         "min_avail_gb": 8.0,          # int4 权重 6.9GB；低于 8GB 才重启
@@ -1109,14 +1129,114 @@ def _fit_aspect(spec, ra, rb):
     spec["width"], spec["height"] = w, h
 
 
+# --native 选中的是最终输出尺寸，必须走单采：二采输出会是档位 × scale，
+# 不再是原生分辨率。预设专属的 VAE 覆盖（如 MOSS 1280 的 taef2）不带走；
+# vae_tiled / vae_tile_size 是显存安全开关，不属于二采语义，保留预设值。
+_NATIVE_CLEAR_KEYS = (
+    "two_pass", "scale", "steps2", "denoise2", "upscale_mode",
+    "upscale_model", "upscale_ratio", "upscale_method",
+    "latent_steps2", "latent_denoise2", "vae",
+)
+
+
+def _parse_aspect(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)",
+                     text.strip())
+    if not m:
+        fail(2, "bad_aspect", f"--aspect 需要 W:H 格式，收到 {text!r}",
+             "例：--aspect 1:1 / 16:9 / 9:16 / 4:5 / 3:2")
+    ra, rb = float(m.group(1)), float(m.group(2))
+    if not (math.isfinite(ra) and math.isfinite(rb)) or ra <= 0 or rb <= 0:
+        fail(2, "bad_aspect", f"--aspect 的宽高必须是有限正数：{text!r}")
+    return ra, rb
+
+
+def _aspect_text(ra, rb):
+    """把 --aspect 输入规范成去掉多余小数的 W:H。"""
+    return f"{ra:g}:{rb:g}"
+
+
+def _aspect_label(w, h):
+    """结果 JSON 用的精确像素比例，例如 1664:928。"""
+    return f"{int(w)}:{int(h)}"
+
+
+def _native_aspect_warning(requested, w, h):
+    """请求比例与最近原生档位有明显偏差时给出可见提示。"""
+    if not requested:
+        return None
+    try:
+        ra, rb = (float(v) for v in requested.split(":"))
+        target = ra / rb
+        actual = w / h
+        if not (math.isfinite(target) and math.isfinite(actual)):
+            return None
+        if abs(math.log(actual / target)) > math.log(1.02):
+            return (f"native_aspect_snapped（请求 {requested}，"
+                    f"最近原生档位是 {w}x{h}，实际 {_aspect_label(w, h)}）")
+    except (ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
+def _snap_native(spec, ra, rb, sizes):
+    """在原生档位里按 log-aspect 距离选最近的一档，忽略预设面积。"""
+    candidates = []
+    for size in sizes or []:
+        try:
+            if isinstance(size, dict):
+                w, h = int(size["width"]), int(size["height"])
+            else:
+                w, h = int(size[0]), int(size[1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            fail(2, "bad_native_sizes", f"原生档位格式错误：{size!r}")
+        if w <= 0 or h <= 0:
+            fail(2, "bad_native_sizes",
+                 f"原生档位 {w}x{h} 的宽高必须大于 0")
+        if max(w, h) > 2048 or w * h > 2048 * 2048:
+            fail(2, "native_size_too_large",
+                 f"原生档位 {w}x{h} 超过本机已验证上限 2048x2048",
+                 "改用 --size 或 --aspect（不加 --native）")
+        candidates.append((w, h))
+    if not candidates:
+        fail(2, "no_native_sizes", "当前模型没有登记原生分辨率档位",
+             "用 --size 或 --aspect（不加 --native）指定尺寸")
+
+    target = ra / rb
+    if not math.isfinite(target) or target <= 0:
+        fail(2, "bad_aspect", f"无法计算比例 {ra:g}:{rb:g}",
+             "换一个正常的 W:H")
+    w, h = min(candidates,
+               key=lambda wh: abs(math.log((wh[0] / wh[1]) / target)))
+    spec["width"], spec["height"] = w, h
+    for key in _NATIVE_CLEAR_KEYS:
+        spec.pop(key, None)
+    return w, h
+
+
 def resolve_spec(a):
     """返回 (spec, preset_name, custom)。--size/--width/--height 走单采。"""
     cfg = a.mcfg
     custom = a.size is not None or a.width is not None or a.height is not None
+    native = bool(getattr(a, "native", False))
+    a.native_snapped = False
+    a.requested_aspect = None
 
     if custom and a.aspect:
         fail(2, "bad_args", "--aspect 与 --size/--width/--height 不能同时使用",
              "--size 直接给尺寸，--aspect 只给比例")
+    if custom and native:
+        fail(2, "bad_args", "--native 与 --size/--width/--height 不能同时使用",
+             "--native 从模型原生档位里选，--size 直接给尺寸")
+    if native:
+        ignored = [flag for flag, value in (
+            ("--scale", a.scale), ("--steps2", a.steps2),
+            ("--denoise2", a.denoise2), ("--latent", a.latent))
+            if value not in (None, False)]
+        if ignored:
+            fail(2, "bad_args",
+                 "--native 走单采，不能同时使用 " + ", ".join(ignored),
+                 "原生档位就是最终尺寸；要二采请去掉 --native")
 
     if custom:
         if a.size:
@@ -1155,17 +1275,19 @@ def resolve_spec(a):
         avail = sorted(list(cfg["presets"]) + list(cfg.get("risky_presets", {})))
         fail(2, "bad_preset", f"{a.model} 没有预设 {preset!r}", f"可选：{', '.join(avail)}")
 
-    # --aspect：保持预设面积，按比例重算首采尺寸（对齐和上限见 _fit_aspect）。
+    # --aspect：默认保持预设面积；--native 则忽略面积，吸附到原生档位。
     if a.aspect:
-        m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*[:xX/]\s*(\d+(?:\.\d+)?)",
-                         a.aspect.strip())
-        if not m:
-            fail(2, "bad_aspect", f"--aspect 需要 W:H 格式，收到 {a.aspect!r}",
-                 "例：--aspect 1:1 / 16:9 / 9:16 / 4:5 / 3:2")
-        ra, rb = float(m.group(1)), float(m.group(2))
-        if ra <= 0 or rb <= 0:
-            fail(2, "bad_aspect", f"--aspect 的宽高必须大于 0：{a.aspect!r}")
-        _fit_aspect(spec, ra, rb)
+        ra, rb = _parse_aspect(a.aspect)
+        a.requested_aspect = _aspect_text(ra, rb)
+        if native:
+            _snap_native(spec, ra, rb, cfg.get("native_sizes"))
+            a.native_snapped = True
+        else:
+            _fit_aspect(spec, ra, rb)
+    elif native:
+        _snap_native(spec, spec["width"], spec["height"],
+                     cfg.get("native_sizes"))
+        a.native_snapped = True
 
     # --latent：二采回退到 latent 放大（krea2 的 2k 默认是像素放大链路）
     if spec.get("two_pass") and a.latent and spec.get("upscale_mode") == "pixel":
@@ -1194,6 +1316,8 @@ def resolve_spec(a):
                  "换一个让输出对齐 8 的 scale（如 1.5 / 1.6 / 2.0）")
     if a.vae_tiled:
         spec["vae_tiled"] = True
+    if a.native_snapped:
+        preset = f"native-{spec['width']}x{spec['height']}"
     return spec, preset, False
 
 
@@ -1371,6 +1495,10 @@ def do_list():
                 for vname, v in (cfg.get("variants") or {}).items()
             ],
             "notes": cfg["notes"],
+            "native_sizes": [
+                {"width": w, "height": h, "aspect": _aspect_label(w, h)}
+                for w, h in cfg.get("native_sizes", [])
+            ],
             "presets": presets,
         })
     try:
@@ -1391,6 +1519,7 @@ def do_list():
             'imggen "提示词"',
             'imggen -m anima "提示词"',
             'imggen -m krea2 --preset 2k "提示词"',
+            'imggen -m krea2 --aspect 16:9 --native "提示词"',
             'imggen -m krea2 --preset 2k --latent "提示词"',
             'imggen -m krea2 --preset 2k-direct "提示词"',
             'imggen -m anima --size 1344x768 "提示词"',
@@ -1434,6 +1563,9 @@ def build_parser():
     ap.add_argument("--aspect", metavar="W:H",
                     help="按长宽比选尺寸（如 1:1 / 16:9 / 9:16 / 4:5）；"
                          "首采按原预设面积换算，二采按同一比例放大")
+    ap.add_argument("--native", action="store_true",
+                    help="吸附到模型的原生分辨率档位（忽略预设面积；"
+                         "与 --aspect 一起按 log-aspect 选最近档，见 --list）")
     ap.add_argument("--height", type=int)
     ap.add_argument("--seed", default="424242", help="整数或 random")
     ap.add_argument("--steps", type=int, help="覆盖首采步数")
@@ -1506,10 +1638,17 @@ def build_parser():
 
 def main():
     a = build_parser().parse_args()
+    a.native_snapped = False
+    a.requested_aspect = None
 
     if a.list:
         do_list()
         return 0
+
+    if a.native and (a.edit or a.inpaint or a.anypaint):
+        fail(2, "bad_args",
+             "--native 只用于文生图，不能与 --edit/--inpaint/--anypaint 同用",
+             "这些模式沿用参考图或源图的尺寸；去掉 --native 即可")
 
     prompt = a.prompt_opt or a.prompt
     if a.prompt_file:
@@ -1631,10 +1770,30 @@ def main():
         graph = build_graph(a, spec, prompt, edit_name)
 
     if a.dry:
+        if a.anypaint:
+            dry_w, dry_h = anypaint_size
+        elif a.inpaint:
+            dry_w, dry_h = refine_size
+        else:
+            dry_w, dry_h = spec["width"], spec["height"]
+        dry_out_w = int(dry_w * spec.get("scale", 1))
+        dry_out_h = int(dry_h * spec.get("scale", 1))
+        dry_warnings = []
+        if a.native_snapped:
+            msg = _native_aspect_warning(a.requested_aspect,
+                                         dry_out_w, dry_out_h)
+            if msg:
+                dry_warnings.append(msg)
         d = {"ok": True, "dry": True, "model": a.model,
              "variant": a.mcfg.get("variant"), "preset": preset,
              "prompt_style": prompt_style,
              "supports_tags": a.mcfg.get("supports_tags", True),
+             "native_snapped": bool(a.native_snapped),
+             "requested_aspect": a.requested_aspect,
+             "actual_aspect": _aspect_label(dry_out_w, dry_out_h),
+             "width": dry_w, "height": dry_h,
+             "output_width": dry_out_w, "output_height": dry_out_h,
+             **({"warnings": dry_warnings} if dry_warnings else {}),
              "spec": spec, "seed": a.seed, "graph": graph}
         if a.anypaint:
             d["anypaint"] = {"source": anypaint_src, "mask": anypaint_mask,
@@ -1775,9 +1934,20 @@ def main():
              "加 --dry 检查 SaveImage 节点")
 
     warnings = []
-    est = a.mcfg["presets"].get(preset, {}).get("est_seconds")
+    out_w = (refine_size[0] if refine_size
+             else int(spec["width"] * spec.get("scale", 1)))
+    out_h = (refine_size[1] if refine_size
+             else int(spec["height"] * spec.get("scale", 1)))
+    if a.native_snapped:
+        msg = _native_aspect_warning(a.requested_aspect, out_w, out_h)
+        if msg:
+            warnings.append(msg)
+    # 原生档位走单采，原 preset 的耗时基准不再适用
+    est = (None if a.native_snapped
+           else a.mcfg["presets"].get(preset, {}).get("est_seconds"))
     # 冷启动判定：实测明显超出热态基准，或提交前显存里几乎没有模型
-    cold_likely = bool(est and elapsed > est * 1.3) or (est is None and elapsed > 20)
+    cold_likely = (bool(est and elapsed > est * 1.3)
+                   or (est is None and not a.native_snapped and elapsed > 20))
     if started:
         warnings.append("auto_started_service")
     if freed:
@@ -1809,18 +1979,19 @@ def main():
         "supports_tags": a.mcfg.get("supports_tags", True),
         "vae": spec.get("vae") or a.mcfg["vae"],
         "preset": preset,
+        "native_snapped": bool(a.native_snapped),
+        "requested_aspect": a.requested_aspect,
+        "actual_aspect": _aspect_label(out_w, out_h),
         "width": refine_size[0] if refine_size else spec["width"],
         "height": refine_size[1] if refine_size else spec["height"],
-        "output_width": (refine_size[0] if refine_size
-                         else int(spec["width"] * spec.get("scale", 1))),
-        "output_height": (refine_size[1] if refine_size
-                          else int(spec["height"] * spec.get("scale", 1))),
+        "output_width": out_w,
+        "output_height": out_h,
         "steps": spec["steps"],
         "steps2": spec.get("steps2"),
         "seed": a.seed,
         "images": paths,
         "seconds": elapsed,
-        "estimated_seconds_hot": a.mcfg["presets"].get(preset, {}).get("est_seconds"),
+        "estimated_seconds_hot": est,
         "cold_likely": cold_likely,
         "restarted": restarted,
         "vram_used_gb": vram_after,

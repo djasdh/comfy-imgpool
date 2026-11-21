@@ -61,6 +61,7 @@ imggen "a red apple on a wooden table"
 imggen -m anima "anime girl in a sunflower field"
 imggen -m krea2 --preset 2k "cinematic swordswoman"
 imggen -m krea2 --preset 2k --aspect 1:1 "cinematic swordswoman"  # square 1536x1536
+imggen -m krea2 --aspect 16:9 --native "cinematic swordswoman"   # native 1664x928
 imggen -m krea2 --preset 2k --latent "photoreal portrait"   # latent upscale (old path)
 imggen -m krea2 --preset 2k-direct "cinematic swordswoman"  # single-pass 2K
 imggen -m anima --size 1344x768 "wide cyberpunk street"
@@ -103,6 +104,9 @@ Success (`imggen`):
   "ok": true,
   "model": "anima",
   "preset": "fast",
+  "native_snapped": false,
+  "requested_aspect": null,
+  "actual_aspect": "1536:1536",
   "width": 1024,
   "height": 1024,
   "output_width": 1536,
@@ -283,6 +287,10 @@ The `MODELS` table near the top of `bin/imggen` is the only place that knows abo
   memory thresholds, `notes`, ...). Select it with `--variant NAME` or the
   `IMGPOOL_VARIANT` env var; `--list` reports every variant. MOSS ships
   `sft-int8` (default), `sft-int4` and `sft-fp16`.
+- `native_sizes`: the model's native resolution buckets used by `--native`;
+  `--list` reports each bucket with its exact pixel aspect ratio. Krea2 uses the
+  published Qwen-Image buckets, MOSS lists its recommended 1 MP buckets (it also
+  accepts arbitrary ratios), and Anima uses 1024²-based SDXL-style buckets.
 - presets: resolution, steps, sampler, optional two-pass upscale
 
 If your ComfyUI does not have `RDNA2Attention` / `ForceUnloadModels`, remove those nodes from `build_graph()` (or keep a compatible node in your install). The measured timings in this repo come from a 16 GB AMD RX 6900 XT; they are reference numbers, not guarantees.
@@ -397,6 +405,21 @@ is 1152×2048. When a ratio would push either the first pass or the two-pass
 output past 2048 px, the area is scaled down to fit (`2k-direct --aspect 21:9`
 → 2048×864); ratios that would change the area by more than 10% on the 16-pixel
 grid are rejected up front.
+
+`--native` ignores the preset's pixel area and snaps to one of the model's
+native resolution buckets instead. With `--aspect W:H` it picks the bucket with
+the closest log-aspect ratio, so `krea2 --aspect 16:9 --native` renders 1664×928
+instead of a non-native 2K size, and `--aspect 21:9 --native` picks the closest
+bucket (with a `native_aspect_snapped` warning) rather than silently shrinking
+the area. Native snapping runs as a single pass at the bucket's exact
+dimensions, so preset two-pass settings are dropped; the preset's VAE tiling
+choice is kept for memory safety. `--size` / `--width` / `--height`, the
+two-pass-only overrides (`--scale`, `--steps2`, `--denoise2`, `--latent`) and
+the source-image modes cannot be combined with `--native`. The buckets are
+listed under `native_sizes` in `imggen --list`, and the result JSON reports
+`native_snapped`, `requested_aspect` and `actual_aspect` (the exact output pixel
+ratio as `W:H`). The default remains off, so presets, `--aspect`, and `--size`
+behave exactly as before.
 
 `krea2 --preset 2k-direct` samples 1152×2048 in a single pass at 8 steps. The
 prompt guides every step at full resolution instead of refining an upscaled
