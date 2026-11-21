@@ -12,7 +12,7 @@
   imggen -m krea2 --preset 2k-direct "提示词"      # 1152×2048 单采，细节更好
   imggen -m moss --size 1024 "提示词"
   imggen -m anima --width 1344 --height 768 "提示词"   # 自定义尺寸走单采
-  imggen -m anima --lora modern-anime-lora:0.8 "提示词"
+  imggen -m krea2 --lora thick:0.8 "提示词"
   imggen --edit a.png "把剑换成蓝色能量刃"          # MOSS 参考图编辑
   imggen --dry -m krea2 "x"                        # 只打印 API graph
 
@@ -1183,7 +1183,7 @@ def do_list():
             'imggen -m krea2 --preset 2k --latent "提示词"',
             'imggen -m krea2 --preset 2k-direct "提示词"',
             'imggen -m anima --size 1344x768 "提示词"',
-            'imggen -m anima --lora modern-anime-lora:0.8 "提示词"',
+            'imggen -m krea2 --lora thick:0.8 "提示词"',
             'imggen -m moss --lora ba "二次元场景"',
             'imggen -m moss --variant sft-int4 "提示词"',
             'imggen -m moss --steps 35 --cfg 3 --negative "worst quality" "提示词"',
