@@ -437,6 +437,12 @@ What the defaults mean:
   so a 300 px face does not get more detail from a 2K canvas. Beyond 1024 the
   model starts hallucinating texture: on anime skin, 1536 produced scattered
   brown specks. 1024 is the sweet spot for a face-sized crop.
+- `--refine-feather 32` and `--refine-shrink 16` are two separate masks. The
+  sampler is restricted to the region shrunk by `shrink`; the composite blends
+  the full region with `feather`. Sampling right up to the hard rectangle edge
+  leaves a bright VAE seam, so the inset keeps that edge on untouched pixels.
+  `--refine-shrink 0` disables the inset if you need the redraw to reach the
+  border.
 
 Measured 17 s warm, 24 s cold, on the same 16 GB card. This refines detail; it
 does not invent missing structure. If the source face is already soft from a

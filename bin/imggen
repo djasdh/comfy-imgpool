@@ -635,11 +635,12 @@ def build_graph(a, spec, prompt_text, edit_image):
     return g
 
 
-def build_refine_graph(a, spec, prompt_text, src_name, mask_name, crop):
+def build_refine_graph(a, spec, prompt_text, src_name, mask_name,
+                       sample_name, crop):
     """局部细化：crop -> 可选 SR 放大 -> mask 内低 denoise 采样 -> 羽化贴回。
 
-    mask 外的像素由 SetLatentNoiseMask 锁死，贴回时再用羽化 mask 混合边界，
-    所以周围内容不会被重画。
+    采样用内缩过的 mask，贴回用外圈羽化 mask：矩形边界落在没有重绘的
+    原图像素上，避免 VAE 在裁剪边缘的亮边直接贴回。
     """
     g = {}
 
@@ -663,10 +664,15 @@ def build_refine_graph(a, spec, prompt_text, src_name, mask_name, crop):
     add(52, "MaskToImage", {"mask": ["51", 0]})
     add(53, "ImageCrop", {"image": ["52", 0], "width": cw, "height": ch,
                           "x": cx, "y": cy})
-    add(54, "ImageToMask", {"image": ["53", 0], "channel": "red"})
-    add(55, "FeatherMask", {"mask": ["54", 0], "left": a.refine_feather,
-                            "top": a.refine_feather, "right": a.refine_feather,
-                            "bottom": a.refine_feather})
+    # mask 已在 prepare_refine 里用 PIL 处理过（ComfyUI 的 FeatherMask
+    # 只处理图像四条边，对 crop 内部的矩形无效；ImageBlur 在大图上会 OOM）。
+    # 55 = 贴回软边；74 = 采样软边（内缩一圈，避开裁剪边缘）。
+    add(55, "ImageToMask", {"image": ["53", 0], "channel": "red"})
+    add(71, "LoadImageMask", {"image": sample_name, "channel": "red"})
+    add(72, "MaskToImage", {"mask": ["71", 0]})
+    add(73, "ImageCrop", {"image": ["72", 0], "width": cw, "height": ch,
+                          "x": cx, "y": cy})
+    add(74, "ImageToMask", {"image": ["73", 0], "channel": "red"})
     add(56, "ImageCrop", {"image": ["50", 0], "width": cw, "height": ch,
                           "x": cx, "y": cy})
 
@@ -680,7 +686,8 @@ def build_refine_graph(a, spec, prompt_text, src_name, mask_name, crop):
                            "width": tw, "height": th, "crop": "disabled"})
 
     add(63, "VAEEncode", {"pixels": ["62", 0], "vae": ["4", 0]})
-    add(64, "SetLatentNoiseMask", {"samples": ["63", 0], "mask": ["54", 0]})
+    # 采样用内缩过的 mask，贴回用外圈软边。
+    add(64, "SetLatentNoiseMask", {"samples": ["63", 0], "mask": ["74", 0]})
     add(65, "KSampler", {"model": ["19", 0], "seed": a.seed,
                          "steps": spec["steps"], "cfg": spec["cfg"],
                          "sampler_name": spec["sampler"],
@@ -834,8 +841,8 @@ def _copy_image(path, prefix):
 
 
 def prepare_refine(a):
-    """读源图/区域，算 crop 计划，并把 mask 写进 input。返回 (源图名, mask名, crop)。"""
-    from PIL import Image, ImageDraw
+    """读源图/区域，算 crop 计划，并把羽化后的 mask 写进 input。"""
+    from PIL import Image, ImageDraw, ImageFilter
 
     src_name, src = _copy_image(a.inpaint, "imggen_inpaint")
     im = Image.open(src)
@@ -881,12 +888,33 @@ def prepare_refine(a):
     tw = max(64, int(round(cw * scale / 16)) * 16)
     th = max(64, int(round(ch * scale / 16)) * 16)
 
-    key = hashlib.sha1(f"{W}x{H}|{cx},{cy},{cw},{ch}".encode()).hexdigest()[:12]
-    mask_name = f"imggen_refine_mask_{key}.png"
-    os.makedirs(INPUT_DIR, exist_ok=True)
-    mask.convert("RGB").save(os.path.join(INPUT_DIR, mask_name))
+    # 采样 mask：向内缩一圈再轻羽化，让重绘内容离开矩形边界，
+    # 避免 VAE 在裁剪边缘留下的亮边直接贴到原图上。
+    if a.refine_shrink is None:
+        shrink = max(8, a.refine_feather // 2)
+    else:
+        shrink = max(0, a.refine_shrink)
 
-    return src_name, mask_name, (cx, cy, cw, ch, tw, th), (W, H)
+    key = hashlib.sha1(
+        f"{W}x{H}|{cx},{cy},{cw},{ch}|{a.refine_feather}|{shrink}".encode()
+    ).hexdigest()[:12]
+    mask_name = f"imggen_refine_mask_{key}.png"
+    sample_name = f"imggen_refine_sample_{key}.png"
+    os.makedirs(INPUT_DIR, exist_ok=True)
+    # 贴回 mask：高斯软边，边界只做颜色过渡。
+    soft = mask.filter(ImageFilter.GaussianBlur(
+        radius=max(1.0, a.refine_feather / 3.0)))
+    soft.convert("RGB").save(os.path.join(INPUT_DIR, mask_name))
+    if shrink:
+        inner = mask.filter(ImageFilter.MinFilter(2 * shrink + 1))
+    else:
+        inner = mask
+    inner = inner.filter(ImageFilter.GaussianBlur(
+        radius=max(1.0, shrink / 2.0)))
+    inner.convert("RGB").save(os.path.join(INPUT_DIR, sample_name))
+
+    return (src_name, mask_name, sample_name,
+            (cx, cy, cw, ch, tw, th), shrink, (W, H))
 
 
 def resolve_spec(a):
@@ -1258,6 +1286,9 @@ def build_parser():
                     help="重绘区域的长边分辨率；默认由档位决定")
     ap.add_argument("--refine-feather", type=int, default=None,
                     help="贴回时的羽化像素；默认由档位决定（32）")
+    ap.add_argument("--refine-shrink", type=int, default=None,
+                    help="采样区域相对 --rect 内缩的像素，默认 feather/2；"
+                         "0 = 不内缩（边界可能出现 VAE 亮边）")
     ap.add_argument("--no-refine-sr", action="store_true",
                     help="不用 AnimeSharp 放大 crop（默认用，线条更稳）")
     ap.add_argument("--refine-sr-model", default="2x-AnimeSharpV2_RPLKSR_Sharp.pth")
@@ -1361,9 +1392,11 @@ def main():
         if not os.path.exists(dst):
             shutil.copyfile(src, dst)
 
-    refine_src = refine_mask = refine_crop = refine_size = None
+    refine_src = refine_mask = refine_sample = refine_crop = None
+    refine_size = refine_shrink = None
     if a.inpaint:
-        refine_src, refine_mask, refine_crop, refine_size = prepare_refine(a)
+        (refine_src, refine_mask, refine_sample, refine_crop,
+         refine_shrink, refine_size) = prepare_refine(a)
 
     if not a.out:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1371,7 +1404,7 @@ def main():
 
     if a.inpaint:
         graph = build_refine_graph(a, spec, prompt, refine_src, refine_mask,
-                                   refine_crop)
+                                   refine_sample, refine_crop)
     else:
         graph = build_graph(a, spec, prompt, edit_name)
 
@@ -1387,7 +1420,9 @@ def main():
                            "denoise": a.refine_denoise,
                            "long_edge": a.refine_long_edge,
                            "pad": a.refine_pad, "feather": a.refine_feather,
+                           "shrink": refine_shrink,
                            "source": refine_src, "mask": refine_mask,
+                           "sample_mask": refine_sample,
                            "crop": refine_crop}
         emit(d)
         return 0
