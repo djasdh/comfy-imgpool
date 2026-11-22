@@ -132,6 +132,14 @@ class SubmissionError(Exception):
 
 # Structured /submit selectors. ``args`` remains the escape hatch for callers
 # that need flags imggen knows but the pool does not model explicitly.
+# Hermes (and other agents) may speak its aspect enum instead of imggen's
+# W:H wire format. Normalize it at the HTTP boundary; the CLI stays W:H-only.
+ASPECT_ALIASES = {
+    "landscape": "16:9",
+    "square": "1:1",
+    "portrait": "9:16",
+}
+
 STRUCTURED_KEYS = {
     "model", "preset", "variant", "vae", "size", "aspect", "width", "height",
     "steps", "steps2", "cfg", "denoise", "denoise2", "scale", "seed",
@@ -318,9 +326,17 @@ def _resolve_plan(mod, ns, model):
     }
 
 
+def _normalize_aspect(value):
+    if isinstance(value, str):
+        return ASPECT_ALIASES.get(value.strip().lower(), value)
+    return value
+
+
 def _prepare_submission(raw):
     """Validate and normalize a /submit body before it can enter the queue."""
     spec = dict(raw or {})
+    if "aspect" in spec:
+        spec["aspect"] = _normalize_aspect(spec["aspect"])
     args = list(spec.get("args") or [])
     if args:
         args = [str(v) for v in args]
@@ -487,6 +503,8 @@ def _structured_args(spec, model):
         key = key.replace("-", "_")
         value = spec.get(key)
         if value is not None:
+            if key == "aspect":
+                value = _normalize_aspect(value)
             args += [flag, str(value)]
     lora_spec = spec.get("lora")
     if isinstance(lora_spec, str):
