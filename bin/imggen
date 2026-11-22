@@ -1442,7 +1442,12 @@ def entry_error(entry):
 # ----------------------------------------------------------------------------
 # --list
 # ----------------------------------------------------------------------------
-def do_list():
+def catalog_models():
+    """Build the model/preset capability list without contacting ComfyUI.
+
+    Used by both ``imggen --list`` and ``imgpool GET /models`` so the table
+    has a single source of truth.
+    """
     models = []
     for name, cfg in MODELS.items():
         presets = []
@@ -1501,6 +1506,11 @@ def do_list():
             ],
             "presets": presets,
         })
+    return models
+
+
+def do_list():
+    models = catalog_models()
     try:
         info = http_json("/object_info/LoraLoaderModelOnly", timeout=10)
         loras = info["LoraLoaderModelOnly"]["input"]["required"]["lora_name"][0]
