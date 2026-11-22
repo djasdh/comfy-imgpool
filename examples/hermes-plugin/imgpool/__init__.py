@@ -43,6 +43,8 @@ DEFAULT_TIMEOUT = 600.0
 DEFAULT_POLL = 2.0
 TERMINAL = ("done", "failed", "cancelled", "interrupted")
 ID_PREFIX = "imgpool-"
+# Hermes uses an aspect enum; imggen's wire format is W:H.
+ASPECT_ALIASES = {"landscape": "16:9", "square": "1:1", "portrait": "9:16"}
 CATALOG_TTL = 15.0
 
 _CATALOG_CACHE: Dict[str, Any] = {"at": 0.0, "data": {}}
@@ -325,7 +327,8 @@ class ImgpoolImageGenProvider(ImageGenProvider):
         seed = int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFF
         payload: Dict[str, Any] = {
             "model": model_name, "source": "hermes", "prompt": prompt,
-            "timeout": int(timeout), "seed": seed, "aspect": aspect,
+            "timeout": int(timeout), "seed": seed,
+            "aspect": ASPECT_ALIASES.get(aspect, aspect),
         }
         if preset:
             payload["preset"] = preset
