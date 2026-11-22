@@ -195,6 +195,54 @@ chmod 600 ~/.config/comfy-imgpool.token
 - There is still no per-user authorization; treat the token as a shared secret
   and keep the port on a private network.
 
+## HTTP API: models and structured submit
+
+`GET /models` (alias `GET /v1/models`) returns the same model/preset table as
+`imggen --list`, built from `MODELS` in `bin/imggen`. It only reads Python data
+and LoRA metadata: no ComfyUI start, no VRAM check, no shell.
+
+```bash
+curl -s -H "X-Imgpool-Token: $T" http://127.0.0.1:8199/models \
+  | jq -r '.models[].default_preset'
+```
+
+The response includes `pool` (`bind`, `concurrency`, `idle_stop_seconds`),
+`default_model`, `models[]` (`model`, `display`, `default_preset`,
+`supports_tags`, `supports_edit`, `supports_anypaint`, `variants`,
+`native_sizes`, `notes`, and `presets[]` with `width`/`height`, `steps`, `cfg`,
+`sampler`, `scheduler`, `risky`, two-pass output dimensions and
+`estimated_seconds_hot`), plus `lora_aliases`.
+
+`POST /submit` accepts the same `model`, `source`, `prompt` and `timeout` as
+before, but model selection can now be structured instead of an opaque `args`
+array:
+
+```json
+{"model": "krea2", "preset": "2k-direct", "aspect": "16:9",
+ "variant": "int8", "lora": ["thick:0.8"], "steps": 30, "cfg": 3,
+ "negative": "worst quality", "seed": 1234, "source": "hermes",
+ "prompt": "a lighthouse at dusk"}
+```
+
+Accepted selectors: `model`, `preset`, `variant`, `size`, `aspect`,
+`width`/`height`, `steps`, `steps2`, `cfg`, `denoise`/`denoise2`, `scale`,
+`lora[]`, `seed`, `negative`, `native`, `latent`, `edit`, `inpaint`, `mask`,
+`rect`, `anypaint`, `allow_risky`, and the `refine*` / `anypaint_*` knobs.
+`aspect` is resolved server-side to concrete dimensions (including two-pass
+output size), so callers do not need to reproduce that table.
+
+- `args` still works unchanged for callers that need raw `imggen` flags.
+  Sending `args` together with structured selectors returns
+  `400 conflicting_args`. A top-level `model` next to `args` is allowed only
+  when it agrees with `--model` inside `args`.
+- Unknown `model` / `preset` / `variant` and bad sizes are rejected before
+  queueing with `400 bad_model` / `bad_preset` / `bad_variant` / `bad_size`
+  (plus `available` for model, preset and variant). A risky preset without
+  `allow_risky` returns `400 risky_preset`.
+- Structured jobs echo the resolved values in `GET /job`: `cli_model`,
+  `preset`, `variant`, `size`, `width`, `height`, `output_width`,
+  `output_height`, `actual_aspect`, `requested_aspect` and `native_snapped`.
+
 ## Hermes agent plugin
 
 `examples/hermes-plugin/imgpool/` is a ready-made Hermes image-generation
@@ -218,8 +266,13 @@ image_gen:
     poll_interval: 2
 ```
 
-Model ids map to `imggen` presets: `imgpool-moss`, `imgpool-anima-fast`,
-`imgpool-anima-1536`, `imgpool-krea2-720p`, `imgpool-krea2-2k`.
+The plugin renders its model list from `GET /models`; ids are
+`imgpool-<model>` for a model's default preset, or `imgpool-<model>-<preset>`
+for a specific one (for example `imgpool-anima-fast`,
+`imgpool-krea2-2k-direct`). The `generate` call accepts optional `preset`,
+`variant`, `size`, `steps`, `cfg`, `lora`, `negative`, `native` and
+`allow_risky` overrides, so an agent can choose per tool call instead of
+editing config and restarting.
 
 ## Idle shutdown
 

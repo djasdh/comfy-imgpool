@@ -39,55 +39,13 @@ from agent.image_gen_provider import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8199"
-DEFAULT_MODEL = "imgpool-moss"
 DEFAULT_TIMEOUT = 600.0
 DEFAULT_POLL = 2.0
 TERMINAL = ("done", "failed", "cancelled", "interrupted")
+ID_PREFIX = "imgpool-"
+CATALOG_TTL = 15.0
 
-# model id -> imggen CLI invocation
-_MODELS: Dict[str, Dict[str, Any]] = {
-    "imgpool-moss": {
-        "display": "imgpool · MOSS-Image 1024",
-        "speed": "~9s warm / ~60s cold",
-        "strengths": "Fast general text-to-image; default backend",
-        "cli": "moss",
-        "sizes": {"landscape": (1344, 768), "square": (1024, 1024),
-                  "portrait": (768, 1344)},
-    },
-    "imgpool-anima-fast": {
-        "display": "imgpool · Anima Turbo (2-pass)",
-        "speed": "~13s warm",
-        "strengths": "Anime/illustration; 1024→1536 two-pass, faster than direct 1536",
-        "cli": "anima",
-        "preset": "fast",
-        "sizes": {"landscape": (1344, 768), "portrait": (768, 1344)},
-    },
-    "imgpool-anima-1536": {
-        "display": "imgpool · Anima 1536",
-        "speed": "~18s warm",
-        "strengths": "Direct 1536 detail for anime/illustration",
-        "cli": "anima",
-        "preset": "1536",
-        "sizes": {"landscape": (1536, 896), "portrait": (896, 1536)},
-    },
-    "imgpool-krea2-720p": {
-        "display": "imgpool · Krea2 720p",
-        "speed": "~10s warm",
-        "strengths": "Cinematic/detailed stills at 720-class resolution",
-        "cli": "krea2",
-        "preset": "720p",
-        "sizes": {"landscape": (1280, 720), "square": (1024, 1024),
-                  "portrait": (720, 1280)},
-    },
-    "imgpool-krea2-2k": {
-        "display": "imgpool · Krea2 2K (2-pass)",
-        "speed": "~27s warm",
-        "strengths": "1152×2048 two-pass; best detail, fixed portrait framing",
-        "cli": "krea2",
-        "preset": "2k",
-        "sizes": {},
-    },
-}
+_CATALOG_CACHE: Dict[str, Any] = {"at": 0.0, "data": {}}
 
 
 def _image_gen_cfg() -> Dict[str, Any]:
@@ -135,25 +93,102 @@ def _timings() -> Tuple[float, float]:
     return max(1.0, poll), max(60.0, timeout)
 
 
-def _resolve_model() -> Tuple[str, Dict[str, Any]]:
-    env = os.environ.get("IMGPOOL_MODEL")
-    if env in _MODELS:
-        return env, _MODELS[env]
-    for cand in (_sub_cfg().get("model"), _image_gen_cfg().get("model")):
-        if isinstance(cand, str) and cand in _MODELS:
-            return cand, _MODELS[cand]
-    return DEFAULT_MODEL, _MODELS[DEFAULT_MODEL]
+def _catalog() -> Dict[str, Any]:
+    """Fetch the model/preset table from the pool; no local copy to drift."""
+    now = time.time()
+    cached = _CATALOG_CACHE.get("data") or {}
+    if cached and now - float(_CATALOG_CACHE.get("at") or 0) < CATALOG_TTL:
+        return cached
+    try:
+        import requests
+
+        r = requests.get(f"{_base_url()}/models", headers=_headers(), timeout=5)
+        r.raise_for_status()
+        data = r.json()
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as exc:
+        logger.debug("Could not load imgpool /models: %s", exc)
+        return cached
+    if data:
+        _CATALOG_CACHE.update({"at": now, "data": data})
+    return data
 
 
-def _build_args(meta: Dict[str, Any], prompt: str, aspect: str,
-                seed: int) -> List[str]:
-    args = ["--model", meta["cli"], prompt, "--seed", str(seed)]
-    size = meta.get("sizes", {}).get(aspect)
-    if size:
-        args += ["--size", f"{size[0]}x{size[1]}"]
-    elif meta.get("preset"):
-        args += ["--preset", meta["preset"]]
-    return args
+def _model_records(catalog: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [m for m in (catalog.get("models") or [])
+            if isinstance(m, dict) and m.get("model")]
+
+
+def _preset_names(meta: Dict[str, Any]) -> List[str]:
+    return [str(p.get("preset")) for p in (meta.get("presets") or [])
+            if isinstance(p, dict) and p.get("preset")]
+
+
+def _strip_prefix(model_id: Any) -> str:
+    mid = str(model_id or "").strip()
+    return mid[len(ID_PREFIX):] if mid.startswith(ID_PREFIX) else mid
+
+
+def _match_model(model_id: Any, catalog: Dict[str, Any]):
+    mid = _strip_prefix(model_id)
+    if not mid:
+        return None
+    records = _model_records(catalog)
+    for meta in records:
+        if mid == str(meta.get("model")):
+            return meta, meta.get("default_preset")
+    # Longest model name first so e.g. krea2 wins over a hypothetical krea.
+    for meta in sorted(records, key=lambda m: len(str(m.get("model"))),
+                       reverse=True):
+        name = str(meta.get("model"))
+        prefix = name + "-"
+        if mid.startswith(prefix):
+            preset = mid[len(prefix):]
+            if preset in _preset_names(meta):
+                return meta, preset
+    return None
+
+
+def _fallback_model(model_id: Any):
+    """Parse imgpool-<model>[-<preset>] when /models is unreachable."""
+    mid = _strip_prefix(model_id)
+    if not mid:
+        return None
+    if "-" in mid:
+        name, preset = mid.split("-", 1)
+        return {"model": name, "display": name}, preset
+    return {"model": mid, "display": mid}, None
+
+
+def _resolve_model(override: Optional[str] = None):
+    catalog = _catalog()
+    requested = override or os.environ.get("IMGPOOL_MODEL")
+    if not requested:
+        for cand in (_sub_cfg().get("model"), _image_gen_cfg().get("model")):
+            if isinstance(cand, str) and cand.strip():
+                requested = cand
+                break
+    hit = _match_model(requested, catalog) if requested else None
+    if hit is None and requested:
+        hit = _fallback_model(requested)
+    if hit is None:
+        records = _model_records(catalog)
+        if records:
+            meta = records[0]
+            hit = (meta, meta.get("default_preset"))
+    if hit is None:
+        return None, None, {}, None
+    meta, preset = hit
+    name = str(meta.get("model"))
+    preset = preset or meta.get("default_preset")
+    if requested and str(requested).startswith(ID_PREFIX):
+        model_id = str(requested)
+    else:
+        model_id = f"{ID_PREFIX}{name}"
+        if preset and preset != meta.get("default_preset"):
+            model_id += f"-{preset}"
+    return name, preset, meta, model_id
 
 
 class ImgpoolImageGenProvider(ImageGenProvider):
@@ -180,19 +215,50 @@ class ImgpoolImageGenProvider(ImageGenProvider):
             return False
 
     def list_models(self) -> List[Dict[str, Any]]:
-        return [
-            {
-                "id": model_id,
-                "display": meta["display"],
-                "speed": meta["speed"],
-                "strengths": meta["strengths"],
-                "price": "free (self-hosted)",
-            }
-            for model_id, meta in _MODELS.items()
-        ]
+        catalog = _catalog()
+        out: List[Dict[str, Any]] = []
+        for meta in _model_records(catalog):
+            name = str(meta.get("model"))
+            default = meta.get("default_preset")
+            presets = [p for p in (meta.get("presets") or [])
+                       if isinstance(p, dict) and p.get("preset")]
+            if not presets:
+                presets = [{"preset": default}]
+            for preset in presets:
+                pname = preset.get("preset") or default
+                model_id = f"{ID_PREFIX}{name}"
+                if pname and pname != default:
+                    model_id += f"-{pname}"
+                est = preset.get("estimated_seconds_hot")
+                speed = f"~{est:g}s warm" if isinstance(est, (int, float)) else "unknown"
+                out_w = preset.get("output_width") or preset.get("width")
+                out_h = preset.get("output_height") or preset.get("height")
+                size = f"{out_w}x{out_h}" if out_w and out_h else None
+                display = str(meta.get("display") or name)
+                if pname:
+                    display = f"{display} · {pname}"
+                strengths = str(meta.get("notes") or "")
+                if preset.get("risky"):
+                    strengths = ("risky/unverified preset. " + strengths).strip()
+                out.append({
+                    "id": model_id,
+                    "display": display,
+                    "speed": speed,
+                    "strengths": strengths,
+                    "price": "free (self-hosted)",
+                    "model": name,
+                    "preset": pname,
+                    "size": size,
+                })
+        return out
 
     def default_model(self) -> Optional[str]:
-        return DEFAULT_MODEL
+        catalog = _catalog()
+        name = catalog.get("default_model")
+        if not name:
+            records = _model_records(catalog)
+            name = records[0].get("model") if records else None
+        return f"{ID_PREFIX}{name}" if name else None
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
@@ -221,7 +287,13 @@ class ImgpoolImageGenProvider(ImageGenProvider):
     ) -> Dict[str, Any]:
         prompt = (prompt or "").strip()
         aspect = resolve_aspect_ratio(aspect_ratio)
-        model_id, meta = _resolve_model()
+        model_name, preset, meta, model_id = _resolve_model(
+            kwargs.get("model") or kwargs.get("model_id"))
+        if not model_name:
+            return error_response(
+                error="imgpool /models is unavailable and no model id was configured",
+                error_type="connection_error", provider="imgpool",
+                model=model_id, aspect_ratio=aspect)
 
         if not prompt:
             return error_response(
@@ -251,13 +323,24 @@ class ImgpoolImageGenProvider(ImageGenProvider):
         headers = _headers()
         poll, timeout = _timings()
         seed = int.from_bytes(os.urandom(4), "big") & 0xFFFFFFFF
-        args = _build_args(meta, prompt, aspect, seed)
+        payload: Dict[str, Any] = {
+            "model": model_name, "source": "hermes", "prompt": prompt,
+            "timeout": int(timeout), "seed": seed, "aspect": aspect,
+        }
+        if preset:
+            payload["preset"] = preset
+        for key in ("preset", "variant", "size", "steps", "steps2", "cfg",
+                    "denoise", "denoise2", "scale", "negative", "lora",
+                    "native", "latent", "allow_risky", "edit", "inpaint",
+                    "mask", "rect", "anypaint", "allow_format_mismatch"):
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
+        if payload.get("size"):
+            payload.pop("aspect", None)
 
         try:
             r = requests.post(
-                f"{base}/submit", headers=headers, timeout=30,
-                json={"model": meta["cli"], "source": "hermes", "prompt": prompt,
-                      "timeout": int(timeout), "args": args})
+                f"{base}/submit", headers=headers, timeout=30, json=payload)
             if r.status_code != 200:
                 return error_response(
                     error=f"imgpool submit failed: HTTP {r.status_code} {r.text[:300]}",
@@ -326,8 +409,11 @@ class ImgpoolImageGenProvider(ImageGenProvider):
             image=image_ref, model=model_id, prompt=prompt, aspect_ratio=aspect,
             provider="imgpool", modality="text",
             extra={"job_id": job_id, "seed": seed, "seconds": seconds,
-                   "cli_model": meta["cli"], "size": size,
-                   "server": base})
+                   "cli_model": job.get("cli_model") or model_name,
+                   "preset": job.get("preset") or preset,
+                   "actual_aspect": job.get("actual_aspect"),
+                   "native_snapped": job.get("native_snapped"),
+                   "size": size, "server": base})
 
 
 def register(ctx) -> None:

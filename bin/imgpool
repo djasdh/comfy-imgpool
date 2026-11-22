@@ -29,8 +29,12 @@
 """
 
 import argparse
+import contextlib
 import hashlib
 import hmac
+import importlib.machinery
+import importlib.util
+import io
 import json
 import mimetypes
 import os
@@ -115,6 +119,395 @@ COMFY_UNIT = os.environ.get("COMFY_UNIT", "comfyui")
 
 DEFAULT_CONCURRENCY = int(os.environ.get("IMGPOOL_CONCURRENCY", "1"))
 DEFAULT_TIMEOUT = 1200
+
+
+class SubmissionError(Exception):
+    """A request that is invalid before it ever reaches the queue."""
+
+    def __init__(self, payload, status=400):
+        super().__init__((payload or {}).get("error") or "bad_request")
+        self.payload = payload or {"ok": False, "error": "bad_request"}
+        self.status = status
+
+
+# Structured /submit selectors. ``args`` remains the escape hatch for callers
+# that need flags imggen knows but the pool does not model explicitly.
+STRUCTURED_KEYS = {
+    "model", "preset", "variant", "vae", "size", "aspect", "width", "height",
+    "steps", "steps2", "cfg", "denoise", "denoise2", "scale", "seed",
+    "negative", "lora", "lora_strength", "native", "latent", "edit",
+    "edit_strength", "inpaint", "mask", "rect", "out", "anypaint",
+    "anypaint_boundary", "anypaint_ref_edge", "anypaint_sr",
+    "anypaint_sr_model", "refine_level", "refine_denoise", "refine_pad",
+    "refine_long_edge", "refine_feather", "refine_shrink", "refine_sr_model",
+    "no_refine_sr", "allow_risky", "allow_format_mismatch", "no_restart",
+    "vae_tiled", "queue_wait", "lock_wait",
+}
+
+_IMGGEN_MOD = None
+_IMGGEN_LOCK = threading.Lock()
+
+
+def _imggen_module():
+    """Import bin/imggen as a module (its filename has no .py suffix)."""
+    global _IMGGEN_MOD
+    if _IMGGEN_MOD is not None:
+        return _IMGGEN_MOD
+    with _IMGGEN_LOCK:
+        if _IMGGEN_MOD is None:
+            loader = importlib.machinery.SourceFileLoader(
+                "_imgpool_imggen", IMGGEN)
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"cannot load imggen from {IMGGEN}")
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            _IMGGEN_MOD = mod
+    return _IMGGEN_MOD
+
+
+def _last_json(text):
+    for line in reversed((text or "").strip().splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
+    return None
+
+
+def _imggen_call(fn, *args, **kwargs):
+    """Call an imggen resolver, converting its fail()+exit into a 400."""
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            return fn(*args, **kwargs)
+    except SystemExit:
+        payload = _last_json(out.getvalue()) or {
+            "ok": False, "error": "bad_request",
+            "message": (out.getvalue() or "").strip()[:800],
+        }
+        payload.setdefault("ok", False)
+        raise SubmissionError(payload) from None
+
+
+def _is_set(value):
+    if value is None or value is False or value == "" or value == [] or value == {}:
+        return False
+    return True
+
+
+def _as_int(value, key):
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise SubmissionError({
+            "ok": False, "error": "bad_args",
+            "message": f"{key} 需要整数，收到 {value!r}"}) from None
+
+
+def _as_float(value, key):
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise SubmissionError({
+            "ok": False, "error": "bad_args",
+            "message": f"{key} 需要数字，收到 {value!r}"}) from None
+
+
+def _as_timeout(value):
+    if value is None or value == "":
+        return None
+    try:
+        timeout = int(value)
+    except (TypeError, ValueError):
+        raise SubmissionError({
+            "ok": False, "error": "bad_timeout",
+            "message": f"timeout 需要整数，收到 {value!r}"}) from None
+    if timeout <= 0:
+        raise SubmissionError({
+            "ok": False, "error": "bad_timeout",
+            "message": "timeout 必须大于 0"})
+    return timeout
+
+
+def _lora_known_locally(mod, item):
+    """Best-effort local check used when ComfyUI is asleep."""
+    name = _lora_name(item)
+    if name in mod.LORA_ALIASES:
+        return True
+    meta = getattr(mod, "LORA_META", None)
+    if meta is not None:
+        try:
+            if meta.find(name):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _lora_name(item):
+    name = str(item)
+    if ":" in name:
+        maybe_name, maybe_strength = name.rsplit(":", 1)
+        try:
+            float(maybe_strength)
+            name = maybe_name
+        except ValueError:
+            pass
+    return name
+
+
+def _resolve_plan(mod, ns, model):
+    """Reuse imggen's validators and return (spec, preset, metadata)."""
+    try:
+        ns.mcfg = _imggen_call(mod.resolve_variant, ns)
+        resolved, preset, custom = _imggen_call(mod.resolve_spec, ns)
+        if getattr(ns, "lora", None):
+            try:
+                ns.loras = _imggen_call(mod.resolve_loras, ns)
+            except SubmissionError as e:
+                # ComfyUI may be asleep. Accept LoRAs we can verify from local
+                # metadata; reject names that are unknown everywhere.
+                if e.payload.get("error") not in (
+                        "service_not_ready", "service_unreachable"):
+                    raise
+                unknown = [str(v) for v in ns.lora
+                           if not _lora_known_locally(mod, v)]
+                if unknown:
+                    raise SubmissionError({
+                        "ok": False, "error": "unknown_lora",
+                        "message": f"LoRA 不存在：{_lora_name(unknown[0])}",
+                        "hint": ("无法连接 ComfyUI 校验；本地已知别名："
+                                 + ", ".join(sorted(mod.LORA_ALIASES))),
+                    }) from None
+    except SubmissionError as e:
+        err = e.payload.get("error")
+        if err in ("bad_preset", "risky_preset"):
+            cfg = mod.MODELS[model]
+            e.payload["available"] = sorted(
+                list(cfg.get("presets") or {})
+                + list(cfg.get("risky_presets") or {}))
+            if err == "risky_preset":
+                e.payload["risky"] = True
+        elif err == "bad_variant":
+            e.payload["available"] = sorted(
+                (mod.MODELS[model].get("variants") or {}))
+        raise
+
+    width = int(resolved["width"])
+    height = int(resolved["height"])
+    scale = float(resolved.get("scale", 1) or 1)
+    out_w, out_h = int(width * scale), int(height * scale)
+    return {
+        "preset": preset,
+        "variant": ns.mcfg.get("variant"),
+        "size": f"{width}x{height}",
+        "width": width,
+        "height": height,
+        "output_width": out_w,
+        "output_height": out_h,
+        "actual_aspect": mod._aspect_label(out_w, out_h),
+        "requested_aspect": getattr(ns, "requested_aspect", None),
+        "native_snapped": bool(getattr(ns, "native_snapped", False)),
+    }
+
+
+def _prepare_submission(raw):
+    """Validate and normalize a /submit body before it can enter the queue."""
+    spec = dict(raw or {})
+    args = list(spec.get("args") or [])
+    if args:
+        args = [str(v) for v in args]
+        mod = _imggen_module()
+        mixed = sorted(k for k in STRUCTURED_KEYS if k != "model"
+                       and _is_set(spec.get(k)))
+        if mixed:
+            raise SubmissionError({
+                "ok": False, "error": "conflicting_args",
+                "message": ("args 与结构化字段不能同时使用："
+                            + ", ".join(mixed)),
+                "fields": mixed,
+            })
+        # Parse/validate the raw args with imggen's own parser and resolvers,
+        # but keep the original argv untouched when the job runs.
+        parsed = _imggen_call(mod.build_parser().parse_args, args)
+        parsed_model = getattr(parsed, "model", mod.DEFAULT_MODEL)
+        body_model = spec.get("model")
+        if body_model and body_model != parsed_model:
+            raise SubmissionError({
+                "ok": False, "error": "conflicting_args",
+                "message": "args 与结构化字段不能同时使用：model",
+                "fields": ["model"],
+            })
+        if not isinstance(parsed_model, str) or parsed_model not in mod.MODELS:
+            available = list(mod.MODELS)
+            raise SubmissionError({
+                "ok": False, "error": "bad_model",
+                "message": f"未知模型 {parsed_model!r}",
+                "available": available,
+                "hint": " / ".join(available),
+            })
+        meta = _resolve_plan(mod, parsed, parsed_model)
+        timeout = _as_timeout(spec.get("timeout"))
+        return {
+            "model": parsed_model,
+            "cli_model": parsed_model,
+            "source": spec.get("source") or "cli",
+            "prompt": (spec.get("prompt") or getattr(parsed, "prompt_opt", None)
+                       or getattr(parsed, "prompt", None) or ""),
+            "timeout": timeout,
+            "args": args,
+            **meta,
+        }
+
+    mod = _imggen_module()
+    requested_model = spec.get("model") or mod.DEFAULT_MODEL
+    if not isinstance(requested_model, str) or requested_model not in mod.MODELS:
+        available = list(mod.MODELS)
+        raise SubmissionError({
+            "ok": False, "error": "bad_model",
+            "message": f"未知模型 {requested_model!r}",
+            "available": available,
+            "hint": " / ".join(available),
+        })
+
+    def get(key, default=None):
+        return spec.get(key, default)
+
+    ns = argparse.Namespace(
+        model=requested_model,
+        variant=get("variant"),
+        preset=get("preset"),
+        size=get("size"),
+        aspect=get("aspect"),
+        width=_as_int(get("width"), "width"),
+        height=_as_int(get("height"), "height"),
+        steps=_as_int(get("steps"), "steps"),
+        steps2=_as_int(get("steps2"), "steps2"),
+        cfg=_as_float(get("cfg"), "cfg"),
+        denoise=_as_float(get("denoise"), "denoise"),
+        denoise2=_as_float(get("denoise2"), "denoise2"),
+        scale=_as_float(get("scale"), "scale"),
+        seed=get("seed", "424242"),
+        negative=get("negative"),
+        lora=([get("lora")] if isinstance(get("lora"), str)
+              else [str(v) for v in (get("lora") or [])]),
+        lora_strength=_as_float(get("lora_strength", 1.0), "lora_strength"),
+        native=bool(get("native")),
+        latent=bool(get("latent")),
+        vae=get("vae"),
+        vae_tiled=bool(get("vae_tiled")),
+        allow_risky=bool(get("allow_risky")),
+        allow_format_mismatch=bool(get("allow_format_mismatch")),
+        edit=get("edit"),
+        edit_strength=_as_float(get("edit_strength"), "edit_strength"),
+        inpaint=get("inpaint"),
+        mask=get("mask"),
+        rect=get("rect"),
+        anypaint=get("anypaint"),
+        anypaint_boundary=_as_int(get("anypaint_boundary"), "anypaint_boundary"),
+        anypaint_ref_edge=_as_int(get("anypaint_ref_edge"), "anypaint_ref_edge"),
+        anypaint_sr=bool(get("anypaint_sr")),
+        anypaint_sr_model=get("anypaint_sr_model"),
+        refine_level=_as_int(get("refine_level", 1), "refine_level"),
+        refine_denoise=_as_float(get("refine_denoise"), "refine_denoise"),
+        refine_pad=_as_int(get("refine_pad"), "refine_pad"),
+        refine_long_edge=_as_int(get("refine_long_edge"), "refine_long_edge"),
+        refine_feather=_as_int(get("refine_feather"), "refine_feather"),
+        refine_shrink=_as_int(get("refine_shrink"), "refine_shrink"),
+        refine_sr_model=get("refine_sr_model"),
+        no_refine_sr=bool(get("no_refine_sr")),
+        no_restart=bool(get("no_restart")),
+        out=get("out"),
+        queue_wait=_as_int(get("queue_wait"), "queue_wait"),
+        lock_wait=_as_int(get("lock_wait"), "lock_wait"),
+        mcfg=None,
+        native_snapped=False,
+        requested_aspect=None,
+        loras=[],
+    )
+    if ns.size is not None and not isinstance(ns.size, str):
+        raise SubmissionError({
+            "ok": False, "error": "bad_size",
+            "message": f"size 需要 WxH 字符串，收到 {ns.size!r}"})
+    if ns.aspect is not None and not isinstance(ns.aspect, str):
+        raise SubmissionError({
+            "ok": False, "error": "bad_aspect",
+            "message": f"aspect 需要 W:H 字符串，收到 {ns.aspect!r}"})
+
+    meta = _resolve_plan(mod, ns, requested_model)
+    timeout = _as_timeout(spec.get("timeout"))
+
+    return {
+        "model": requested_model,
+        "cli_model": requested_model,
+        "source": spec.get("source") or "cli",
+        "prompt": spec.get("prompt", ""),
+        "timeout": timeout,
+        "args": _structured_args(spec, requested_model),
+        **meta,
+    }
+
+
+def _structured_args(spec, model):
+    """Translate structured /submit fields into imggen CLI arguments."""
+    args = ["--model", model]
+    prompt = spec.get("prompt")
+    if prompt:
+        args.append(str(prompt))
+    for key, flag in (
+        ("seed", "--seed"), ("preset", "--preset"), ("variant", "--variant"),
+        ("vae", "--vae"), ("size", "--size"), ("aspect", "--aspect"),
+        ("width", "--width"), ("height", "--height"), ("steps", "--steps"),
+        ("steps2", "--steps2"), ("cfg", "--cfg"), ("denoise", "--denoise"),
+        ("denoise2", "--denoise2"), ("scale", "--scale"),
+        ("negative", "--negative"), ("edit", "--edit"),
+        ("edit-strength", "--edit-strength"), ("inpaint", "--inpaint"),
+        ("rect", "--rect"), ("mask", "--mask"), ("out", "--out"),
+        ("refine-level", "--refine-level"),
+        ("refine-denoise", "--refine-denoise"),
+        ("refine-pad", "--refine-pad"),
+        ("refine-long-edge", "--refine-long-edge"),
+        ("refine-feather", "--refine-feather"),
+        ("refine-shrink", "--refine-shrink"),
+        ("refine-sr-model", "--refine-sr-model"),
+        ("anypaint", "--anypaint"),
+        ("anypaint-boundary", "--anypaint-boundary"),
+        ("anypaint-ref-edge", "--anypaint-ref-edge"),
+        ("anypaint-sr-model", "--anypaint-sr-model"),
+        ("lora-strength", "--lora-strength"),
+        ("queue-wait", "--queue-wait"), ("lock-wait", "--lock-wait"),
+    ):
+        key = key.replace("-", "_")
+        value = spec.get(key)
+        if value is not None:
+            args += [flag, str(value)]
+    lora_spec = spec.get("lora")
+    if isinstance(lora_spec, str):
+        loras = [lora_spec]
+    elif lora_spec:
+        loras = [str(v) for v in lora_spec]
+    else:
+        loras = []
+    for value in loras:
+        args += ["--lora", value]
+    for key, flag in (
+        ("native", "--native"), ("latent", "--latent"),
+        ("allow_risky", "--allow-risky"),
+        ("allow_format_mismatch", "--allow-format-mismatch"),
+        ("no_refine_sr", "--no-refine-sr"), ("anypaint_sr", "--anypaint-sr"),
+        ("vae_tiled", "--vae-tiled"), ("no_restart", "--no-restart"),
+    ):
+        if spec.get(key):
+            args.append(flag)
+    return args
+
 
 
 def now_iso():
@@ -223,6 +616,13 @@ class Pool:
         if full:
             d["args"] = job["args"]
             d["prompt"] = job.get("prompt", "")
+            for key in ("cli_model", "preset", "variant", "size", "width",
+                        "height", "output_width", "output_height",
+                        "actual_aspect", "requested_aspect"):
+                if job.get(key) is not None:
+                    d[key] = job.get(key)
+            if job.get("native_snapped") is not None:
+                d["native_snapped"] = bool(job.get("native_snapped"))
             d["result"] = job.get("result")
             d["error"] = job.get("error")
             d["error_layer"] = job.get("error_layer")
@@ -283,6 +683,7 @@ class Pool:
 
     # ---- 生命周期 ---------------------------------------------------------
     def submit(self, spec):
+        prepared = _prepare_submission(spec)
         # 与空闲停机互斥：要么在停机判定前登记活动，要么等停机结束后再提交，
         # 由 imggen 的 ensure_service 重新拉起 ComfyUI，避免任务被杀。
         with self.stop_lock, self.cv:
@@ -293,13 +694,24 @@ class Pool:
                    f"{uuid.uuid4().hex[:6]}")
             job = Job(
                 id=jid, seq=self.seq,
-                model=spec.get("model") or "moss",
-                source=spec.get("source") or "cli",
-                prompt=spec.get("prompt", ""),
-                args=list(spec.get("args") or []),
-                timeout=int(spec.get("timeout") or DEFAULT_TIMEOUT),
+                model=prepared["model"],
+                source=prepared["source"],
+                prompt=prepared["prompt"],
+                args=list(prepared["args"]),
+                timeout=int(prepared.get("timeout") or DEFAULT_TIMEOUT),
                 state="queued",
                 submitted_at=now_iso(),
+                cli_model=prepared.get("cli_model") or prepared["model"],
+                preset=prepared.get("preset"),
+                variant=prepared.get("variant"),
+                size=prepared.get("size"),
+                width=prepared.get("width"),
+                height=prepared.get("height"),
+                output_width=prepared.get("output_width"),
+                output_height=prepared.get("output_height"),
+                actual_aspect=prepared.get("actual_aspect"),
+                requested_aspect=prepared.get("requested_aspect"),
+                native_snapped=prepared.get("native_snapped"),
             )
             self.jobs[jid] = job
             self.order.append(jid)
@@ -569,7 +981,18 @@ class Pool:
                           exit_code=j.get("exit_code"),
                           result=j.get("result"),
                           error=j.get("error"),
-                          cli_log=j.get("cli_log"))
+                          cli_log=j.get("cli_log"),
+                          cli_model=j.get("cli_model") or j.get("model"),
+                          preset=j.get("preset"),
+                          variant=j.get("variant"),
+                          size=j.get("size"),
+                          width=j.get("width"),
+                          height=j.get("height"),
+                          output_width=j.get("output_width"),
+                          output_height=j.get("output_height"),
+                          actual_aspect=j.get("actual_aspect"),
+                          requested_aspect=j.get("requested_aspect"),
+                          native_snapped=j.get("native_snapped"))
                 job["_history"] = True
                 self.jobs[jid] = job
                 self.order.append(jid)
@@ -676,6 +1099,19 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True, "pid": os.getpid(),
                     "concurrency": POOL.concurrency,
                     "queue": POOL.queue_snapshot()})
+            if u.path in ("/models", "/v1/models"):
+                mod = _imggen_module()
+                return self._send(200, {
+                    "ok": True,
+                    "pool": {"bind": BIND,
+                             "concurrency": POOL.concurrency,
+                             "idle_stop_seconds": IDLE_STOP_SECONDS},
+                    "default_model": mod.DEFAULT_MODEL,
+                    "models": mod.catalog_models(),
+                    "lora_aliases": {
+                        k: {"file": v[0], "strength": v[1]}
+                        for k, v in mod.LORA_ALIASES.items()},
+                })
             if u.path == "/queue":
                 return self._send(200, {"ok": True, "queue": POOL.queue_snapshot()})
             if u.path == "/job":
@@ -745,6 +1181,8 @@ class Handler(BaseHTTPRequestHandler):
                                  daemon=True).start()
                 return self._send(200, res)
             return self._send(404, {"ok": False, "error": "unknown_path"})
+        except SubmissionError as e:
+            return self._send(e.status, e.payload)
         except Exception as e:
             return self._send(500, {"ok": False, "error": f"{type(e).__name__}: {e}"})
 
