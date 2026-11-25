@@ -31,6 +31,7 @@ import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+import zlib
 from datetime import datetime
 
 # LoRA 元数据（loras/<model>.json）。缺失时 imggen 仍按内置别名工作。
@@ -806,6 +808,1338 @@ def build_refine_graph(a, spec, prompt_text, src_name, mask_name,
 
 
 # ----------------------------------------------------------------------------
+# 入图反解（只读）：PNG 文本块 / JPEG·WebP EXIF / XMP -> imggen 配方
+# ----------------------------------------------------------------------------
+# 这里刻意只读取 ComfyUI 的 API 图（PNG 的 prompt 块）。UI 图（workflow
+# 块）里的 widget 值可能是被连线覆盖后的残留，读它会还原出没有生效的参数。
+_SECRET_KEY_RE = re.compile(
+    r"(token|secret|password|passwd|api[_-]?key|authorization|credential|cookie)",
+    re.I)
+_TIFF_TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2,
+                    9: 4, 10: 8, 11: 4, 12: 8}
+
+
+def _redact_metadata(value, key=""):
+    """去掉外部 workflow 里可能出现的凭据字段，其余原样保留。"""
+    if isinstance(value, dict):
+        return {k: ("***" if _SECRET_KEY_RE.search(str(k))
+                    else _redact_metadata(v, k))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_metadata(v, key) for v in value]
+    if isinstance(value, str) and _SECRET_KEY_RE.search(str(key)):
+        return "***"
+    return value
+
+
+def _png_text_decode(data):
+    """PNG 规范写 Latin-1，但 A1111 等实际会塞 UTF-8；优先 UTF-8。"""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
+def _png_text_chunks(data):
+    out = {}
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return out
+    pos = 8
+    while pos + 8 <= len(data):
+        n = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + n]
+        pos += 12 + n
+        try:
+            if ctype == b"tEXt":
+                k, _, v = body.partition(b"\0")
+                out[k.decode("latin-1")] = _png_text_decode(v)
+            elif ctype == b"iTXt":
+                k, _, rest = body.partition(b"\0")
+                if len(rest) < 2:
+                    continue
+                compressed, rest = rest[0], rest[2:]
+                parts = rest.split(b"\0", 2)
+                if len(parts) < 3:
+                    continue
+                text = parts[2]
+                if compressed == 1:
+                    text = zlib.decompress(text)
+                out[k.decode("latin-1")] = text.decode("utf-8", "replace")
+            elif ctype == b"zTXt":
+                k, _, rest = body.partition(b"\0")
+                if rest:
+                    out[k.decode("latin-1")] = _png_text_decode(
+                        zlib.decompress(rest[1:]))
+        except Exception:
+            # 单个坏块不能毁掉整张图的其它元数据
+            continue
+        if ctype == b"IEND":
+            break
+    return out
+
+
+def _png_size(data):
+    if (len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n")
+            and data[12:16] == b"IHDR"):
+        return struct.unpack(">II", data[16:24])
+    return None
+
+
+def _tiff_value(data, off, endian, typ, count):
+    size = _TIFF_TYPE_SIZES.get(typ)
+    if not size or count < 0:
+        return None
+    total = size * count
+    if off < 0 or off + total > len(data):
+        return None
+    raw = data[off:off + total]
+    if typ == 7:
+        return raw
+    if typ == 1:
+        return raw if count > 1 else raw[0]
+    if typ == 2:
+        return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+    if typ in (5, 10):
+        fmt = endian + ("II" if typ == 5 else "ii")
+        vals = []
+        for i in range(count):
+            try:
+                vals.append(struct.unpack(fmt, raw[i * 8:i * 8 + 8]))
+            except struct.error:
+                break
+        return vals
+    fmt = {3: "H", 4: "I", 6: "b", 8: "h", 9: "i",
+           11: "f", 12: "d"}.get(typ)
+    if not fmt:
+        return raw
+    try:
+        vals = list(struct.unpack(endian + fmt * count, raw))
+    except struct.error:
+        return None
+    return vals[0] if count == 1 else vals
+
+
+def _tiff_ifd(data, offset, endian):
+    out = {}
+    if offset < 0 or offset + 2 > len(data):
+        return out
+    count = struct.unpack(endian + "H", data[offset:offset + 2])[0]
+    for i in range(count):
+        p = offset + 2 + i * 12
+        if p + 12 > len(data):
+            break
+        tag, typ, n = struct.unpack(endian + "HHI", data[p:p + 8])
+        field = struct.unpack(endian + "I", data[p + 8:p + 12])[0]
+        value_size = _TIFF_TYPE_SIZES.get(typ, 0) * n
+        val = _tiff_value(data, p + 8 if value_size <= 4 else field,
+                          endian, typ, n)
+        out[tag] = val
+    return out
+
+
+def _parse_exif(data):
+    if not data:
+        return {}
+    if data.startswith(b"Exif\0\0"):
+        data = data[6:]
+    if len(data) < 8:
+        return {}
+    if data[:2] == b"II":
+        endian = "<"
+    elif data[:2] == b"MM":
+        endian = ">"
+    else:
+        return {}
+    try:
+        if struct.unpack(endian + "H", data[2:4])[0] != 42:
+            return {}
+        off = struct.unpack(endian + "I", data[4:8])[0]
+    except struct.error:
+        return {}
+    ifd0 = _tiff_ifd(data, off, endian)
+    out = {}
+    names = {0x010E: "ImageDescription", 0x0131: "Software",
+             0x9286: "UserComment", 0x9C9B: "XPTitle",
+             0x9C9C: "XPComment", 0x9C9E: "XPKeywords"}
+    for tag, name in names.items():
+        if tag in ifd0:
+            out[name] = ifd0[tag]
+    exif_off = ifd0.get(0x8769)
+    if isinstance(exif_off, int):
+        exif = _tiff_ifd(data, exif_off, endian)
+        for tag, name in names.items():
+            if tag in exif:
+                out[name] = exif[tag]
+    return out
+
+
+def _decode_exif_text(value):
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, (bytes, bytearray)):
+        return ""
+    raw = bytes(value)
+    if raw.startswith(b"ASCII\0\0\0"):
+        return raw[8:].decode("utf-8", "replace").rstrip("\0")
+    if raw.startswith(b"UNICODE\0"):
+        raw = raw[8:]
+        if raw.startswith(b"\xff\xfe"):
+            raw = raw[2:]
+        try:
+            return raw.decode("utf-16-le").rstrip("\0")
+        except UnicodeDecodeError:
+            pass
+    if raw.startswith(b"JIS\0\0\0\0\0"):
+        return raw[8:].decode("shift_jis", "replace").rstrip("\0")
+    for enc in ("utf-8", "utf-16-le", "utf-16-be", "latin-1"):
+        try:
+            s = raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        if s.count("\ufffd") <= len(s) // 4:
+            return s.rstrip("\0")
+    return raw.decode("latin-1", "replace").rstrip("\0")
+
+
+def _jpeg_metadata(data):
+    out = {"xmp": []}
+    size = None
+    sof = set(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}
+    i = 2
+    while i + 1 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        while i < len(data) and data[i] == 0xFF:
+            i += 1
+        if i >= len(data):
+            break
+        marker = data[i]
+        i += 1
+        if marker == 0x00:
+            continue
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            if marker == 0xD9:
+                break
+            continue
+        if i + 2 > len(data):
+            break
+        seglen = struct.unpack(">H", data[i:i + 2])[0]
+        if seglen < 2:
+            break
+        seg = data[i + 2:i + seglen]
+        i += seglen
+        if marker in sof and len(seg) >= 5:
+            h, w = struct.unpack(">HH", seg[1:5])
+            size = (w, h)
+        elif marker == 0xE1:
+            if seg.startswith(b"Exif\0\0"):
+                try:
+                    out.update(_parse_exif(seg))
+                except Exception:
+                    pass
+            elif seg.startswith(b"http://ns.adobe.com/xap/1.0/\0"):
+                out["xmp"].append(seg.split(b"\0", 1)[1].decode(
+                    "utf-8", "replace"))
+        elif marker == 0xDA:
+            break
+    out["size"] = size
+    return out
+
+
+def _webp_metadata(data):
+    out = {"xmp": []}
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return out
+    pos = 12
+    size = None
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        n = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + n]
+        try:
+            if cid == b"VP8X" and len(body) >= 10:
+                size = (1 + int.from_bytes(body[4:7], "little"),
+                        1 + int.from_bytes(body[7:10], "little"))
+            elif cid == b"VP8 " and len(body) >= 10:
+                if body[3:6] == b"\x9d\x01\x2a":
+                    size = (struct.unpack("<H", body[6:8])[0] & 0x3fff,
+                            struct.unpack("<H", body[8:10])[0] & 0x3fff)
+            elif cid == b"VP8L" and len(body) >= 5 and body[0] == 0x2f:
+                bits = int.from_bytes(body[1:5], "little")
+                size = ((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+            elif cid == b"EXIF":
+                out.update(_parse_exif(body))
+            elif cid == b"XMP ":
+                out["xmp"].append(body.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        pos += 8 + n + (n & 1)
+    out["size"] = size
+    return out
+
+
+def _read_image_metadata(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    meta = {}
+    size = None
+    fmt = None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        fmt = "png"
+        meta = _png_text_chunks(data)
+        size = _png_size(data)
+    elif data.startswith(b"\xff\xd8"):
+        fmt = "jpeg"
+        info = _jpeg_metadata(data)
+        size = info.pop("size", None)
+        xmp = info.pop("xmp", [])
+        meta.update(info)
+        if xmp:
+            meta["_xmp"] = "\n".join(xmp)
+    elif len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        fmt = "webp"
+        info = _webp_metadata(data)
+        size = info.pop("size", None)
+        xmp = info.pop("xmp", [])
+        meta.update(info)
+        if xmp:
+            meta["_xmp"] = "\n".join(xmp)
+    if not size:
+        size = _png_size(data)
+    return fmt, size, meta
+
+
+def _redact_json_text(text):
+    """JSON 元数据块先解析再按敏感键脱敏；非 JSON 原样保留。"""
+    try:
+        obj = json.loads(text)
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(obj, (dict, list)):
+        return text
+    return json.dumps(_redact_metadata(obj), ensure_ascii=False)
+
+
+def _meta_as_strings(meta):
+    out = {}
+    for k, v in (meta or {}).items():
+        if isinstance(v, (bytes, bytearray)):
+            v = _decode_exif_text(v)
+        elif isinstance(v, str):
+            pass
+        elif isinstance(v, (dict, list)):
+            v = _redact_metadata(v, k)
+        else:
+            v = str(v)
+        out[str(k)] = v
+    return out
+
+
+def parse_metadata(path):
+    """只读解析图片元数据，不执行 workflow、不写任何文件。
+
+    返回 dict，识别到格式时 ok=True 且 source 为 comfyui/a1111/novelai/
+    fooocus；否则 ok=False, error='no_metadata'。原始块保留在 raw 便于回查。
+    """
+    p = os.path.abspath(os.path.expanduser(str(path)))
+    if not os.path.isfile(p):
+        return {"ok": False, "error": "file_not_found", "image": p}
+    try:
+        fmt, size, meta = _read_image_metadata(p)
+    except OSError as e:
+        return {"ok": False, "error": "image_unreadable", "image": p,
+                "message": str(e)}
+    except Exception as e:
+        return {"ok": False, "error": "image_unreadable", "image": p,
+                "message": f"{type(e).__name__}: {e}"}
+
+    raw = _meta_as_strings(meta)
+    for key in ("prompt", "workflow"):
+        if key in raw:
+            raw[key] = _redact_json_text(raw[key])
+    # A1111/Forge 在 JPEG/WebP 里把 parameters 写进 EXIF UserComment
+    # （有时写 ImageDescription），转成统一的 parameters 键。
+    if "parameters" not in raw:
+        for key in ("UserComment", "ImageDescription"):
+            text = raw.get(key)
+            if text and ("Steps:" in text or "Negative prompt:" in text):
+                raw["parameters"] = text
+                break
+    info = {
+        "ok": False,
+        "image": p,
+        "format": fmt,
+        "size": ({"width": int(size[0]), "height": int(size[1])}
+                 if size else None),
+        "raw": _redact_metadata(raw),
+    }
+
+    def pick(name):
+        for k, v in raw.items():
+            if k.lower() == name.lower():
+                return v
+        return None
+
+    workflow_raw = pick("workflow")
+    if workflow_raw:
+        try:
+            info["workflow"] = json.loads(workflow_raw)
+        except Exception:
+            info["workflow_raw"] = workflow_raw
+
+    prompt_raw = pick("prompt")
+    if prompt_raw:
+        try:
+            graph = json.loads(prompt_raw)
+        except Exception:
+            graph = None
+        if isinstance(graph, dict) and any(
+                isinstance(v, dict) and "class_type" in v
+                for v in graph.values()):
+            info.update(ok=True, source="comfyui", comfy_api=graph)
+            return info
+        # prompt 不是 API 图时，绝不回退到 workflow 的 widget 值。
+
+    parameters = pick("parameters")
+    if parameters:
+        if parameters.lstrip().startswith("{"):
+            try:
+                obj = json.loads(parameters)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict) and (
+                    "prompt" in obj or "base_model" in obj):
+                info.update(ok=True, source="fooocus", fooocus=obj)
+                return info
+        info.update(ok=True, source="a1111", a1111=parameters)
+        return info
+
+    comment = pick("Comment")
+    if comment:
+        try:
+            obj = json.loads(comment)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            info.update(ok=True, source="novelai", comment=obj)
+            return info
+
+    fooocus = pick("fooocus")
+    if fooocus:
+        try:
+            obj = json.loads(fooocus)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            info.update(ok=True, source="fooocus", fooocus=obj)
+            return info
+
+    xmp = pick("_xmp")
+    if xmp and ("Steps:" in xmp or "Negative prompt:" in xmp):
+        info.update(ok=True, source="a1111", a1111=xmp)
+        return info
+
+    info["error"] = "no_metadata"
+    return info
+
+
+def _graph_node(graph, nid):
+    if not isinstance(graph, dict):
+        return None
+    node = graph.get(str(nid))
+    return node if isinstance(node, dict) else None
+
+
+def _link_id(value):
+    if (isinstance(value, list) and len(value) >= 2
+            and isinstance(value[0], (str, int))):
+        return str(value[0])
+    return None
+
+
+def _input_links(node):
+    inputs = node.get("inputs") if isinstance(node, dict) else None
+    for value in (inputs or {}).values():
+        nid = _link_id(value)
+        if nid:
+            yield nid
+
+
+def _find_upstream(graph, start, classes, limit=500):
+    nid = _link_id(start)
+    if nid is None and isinstance(start, (str, int)):
+        nid = str(start)
+    if nid is None or nid not in graph:
+        return None
+    queue = [nid]
+    seen = set()
+    while queue and len(seen) < limit:
+        cur = queue.pop(0)
+        if cur in seen:
+            continue
+        seen.add(cur)
+        node = _graph_node(graph, cur)
+        if node is None:
+            continue
+        if node.get("class_type") in classes:
+            return cur
+        queue.extend(_input_links(node))
+    return None
+
+
+def _text_from_link(graph, link, seen=None):
+    seen = seen if seen is not None else set()
+    nid = _link_id(link)
+    if not nid or nid in seen:
+        return None
+    seen.add(nid)
+    node = _graph_node(graph, nid)
+    if node is None:
+        return None
+    cls = node.get("class_type")
+    inputs = node.get("inputs") or {}
+    if cls == "ConditioningZeroOut":
+        return ""
+    for key in ("text", "prompt"):
+        value = inputs.get(key)
+        if isinstance(value, str):
+            return value
+        if _link_id(value):
+            text = _text_from_link(graph, value, seen)
+            if text is not None:
+                return text
+    for key in ("conditioning", "positive", "negative",
+                "conditioning_1", "conditioning_2"):
+        if key in inputs:
+            text = _text_from_link(graph, inputs[key], seen)
+            if text is not None:
+                return text
+    return None
+
+
+def _num(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_file(name):
+    if not isinstance(name, str):
+        return ""
+    s = name.replace("\\", "/").split("/")[-1].strip().lower()
+    for ext in (".safetensors", ".ckpt", ".pt", ".pth", ".bin"):
+        if s.endswith(ext):
+            s = s[:-len(ext)]
+            break
+    return s
+
+
+def _unet_index():
+    index = {}
+    for model, cfg in MODELS.items():
+        variants = cfg.get("variants") or {}
+        if variants:
+            for vname, vcfg in variants.items():
+                unet = (vcfg or {}).get("unet") or cfg.get("unet")
+                if unet:
+                    index.setdefault(_norm_file(unet), []).append(
+                        (model, vname))
+        elif cfg.get("unet"):
+            index.setdefault(_norm_file(cfg["unet"]), []).append(
+                (model, cfg.get("default_variant") or "default"))
+    return index
+
+
+def _clip_index():
+    index = {}
+    for model, cfg in MODELS.items():
+        clip = cfg.get("clip") or {}
+        if clip.get("clip_name"):
+            index.setdefault(_norm_file(clip["clip_name"]), []).append(
+                (model, clip.get("type")))
+    return index
+
+
+def _known_upscale_models():
+    names = set()
+    for cfg in MODELS.values():
+        for preset in (cfg.get("presets") or {}).values():
+            if preset.get("upscale_model"):
+                names.add(_norm_file(preset["upscale_model"]))
+        for key in ("anypaint_sr_model", "refine_sr_model"):
+            if cfg.get(key):
+                names.add(_norm_file(cfg[key]))
+    names.add(_norm_file("2x-AnimeSharpV2_RPLKSR_Sharp.pth"))
+    return names
+
+
+def _known_node_classes():
+    return {
+        "UNETLoader", "LoraLoader", "LoraLoaderModelOnly",
+        "RDNA2Attention", "CLIPLoader", "VAELoader", "LoadImage",
+        "LoadImageMask", "TextEncodeMOSSImageEdit", "ConditioningZeroOut",
+        "CLIPTextEncode", "ForceUnloadModels", "EmptyLatentImage",
+        "KSampler", "KSamplerAdvanced", "VAEDecode", "VAEDecodeTiled",
+        "VAEEncode", "VAEEncodeTiled", "UpscaleModelLoader",
+        "ImageUpscaleWithModel", "ImageScale", "ImageScaleBy",
+        "LatentUpscaleBy", "SaveImage", "Krea2AnyPaintModelPatch",
+        "Krea2AnyPaintPrepare", "Krea2AnyPaintEncode", "MaskToImage",
+        "ImageCrop", "ImageToMask", "SetLatentNoiseMask",
+        "ImageCompositeMasked", "CheckpointLoaderSimple",
+    }
+
+
+def _first_node(graph, classes):
+    hits = []
+    for nid, node in (graph or {}).items():
+        if isinstance(node, dict) and node.get("class_type") in classes:
+            try:
+                hits.append((int(nid), nid, node))
+            except (TypeError, ValueError):
+                hits.append((10 ** 9, nid, node))
+    hits.sort(key=lambda item: (item[0], str(item[1])))
+    return hits
+
+
+def _sampler_brief(node):
+    inputs = (node or {}).get("inputs") or {}
+    return {
+        "steps": _num(inputs.get("steps")),
+        "cfg": _num(inputs.get("cfg")),
+        "sampler": inputs.get("sampler_name"),
+        "scheduler": inputs.get("scheduler"),
+        "denoise": _num(inputs.get("denoise")),
+        "seed": _num(inputs.get("seed")),
+    }
+
+
+def _first_pass_size(graph, sampler):
+    inputs = (sampler or {}).get("inputs") or {}
+    latent = inputs.get("latent_image")
+    nid = _link_id(latent)
+    if nid:
+        node = _graph_node(graph, nid)
+        if node and node.get("class_type") == "EmptyLatentImage":
+            li = node.get("inputs") or {}
+            return _num(li.get("width")), _num(li.get("height"))
+    empty = _find_upstream(graph, latent, {"EmptyLatentImage"})
+    node = _graph_node(graph, empty) if empty else None
+    if node:
+        li = node.get("inputs") or {}
+        return _num(li.get("width")), _num(li.get("height"))
+    return None, None
+
+
+def _upscale_info(graph, sampler):
+    inputs = (sampler or {}).get("inputs") or {}
+    latent = inputs.get("latent_image")
+    latent_node = _graph_node(graph, _link_id(latent))
+    info = {}
+    if not latent_node:
+        return info
+    cls = latent_node.get("class_type")
+    li = latent_node.get("inputs") or {}
+    if cls == "LatentUpscaleBy":
+        info.update(upscale_mode="latent",
+                    scale_by=_num(li.get("scale_by")),
+                    upscale_method=li.get("upscale_method"))
+        return info
+
+    scale_nid = _find_upstream(graph, latent, {"ImageScaleBy", "ImageScale"})
+    sr_nid = _find_upstream(graph, latent, {"ImageUpscaleWithModel"})
+    if not scale_nid and not sr_nid and cls in (
+            "VAEEncode", "VAEEncodeTiled", "SetLatentNoiseMask"):
+        pixels = li.get("pixels") or li.get("samples")
+        scale_nid = _find_upstream(graph, pixels, {"ImageScaleBy", "ImageScale"})
+        sr_nid = _find_upstream(graph, pixels, {"ImageUpscaleWithModel"})
+    if scale_nid or sr_nid:
+        info["upscale_mode"] = "pixel"
+    if scale_nid:
+        snode = _graph_node(graph, scale_nid) or {}
+        si = snode.get("inputs") or {}
+        info["scale_by"] = _num(si.get("scale_by"))
+        if info["scale_by"] is None and si.get("width") and si.get("height"):
+            info["target_width"] = _num(si.get("width"))
+            info["target_height"] = _num(si.get("height"))
+    if sr_nid:
+        srnode = _graph_node(graph, sr_nid) or {}
+        model_link = (srnode.get("inputs") or {}).get("upscale_model")
+        loader = _find_upstream(graph, model_link, {"UpscaleModelLoader"})
+        lnode = _graph_node(graph, loader) if loader else None
+        if lnode:
+            info["upscale"] = (lnode.get("inputs") or {}).get("model_name")
+    return info
+
+
+def _collect_loras(graph, sampler):
+    inputs = (sampler or {}).get("inputs") or {}
+    start = _link_id(inputs.get("model"))
+    ids = []
+    seen = set()
+
+    def walk(nid):
+        if not nid or nid in seen:
+            return
+        seen.add(nid)
+        node = _graph_node(graph, nid)
+        if node is None:
+            return
+        if node.get("class_type") in ("LoraLoaderModelOnly", "LoraLoader"):
+            ids.append(nid)
+        for child in _input_links(node):
+            walk(child)
+
+    walk(start)
+    if not ids:
+        ids = [item[1] for item in _first_node(
+            graph, {"LoraLoaderModelOnly", "LoraLoader"})]
+    ordered = []
+    for nid in sorted(ids, key=lambda v: (int(v) if str(v).isdigit()
+                                          else 10 ** 9, str(v))):
+        node = _graph_node(graph, nid)
+        if node and node not in ordered:
+            ordered.append(node)
+    return ordered
+
+
+def _file_to_lora_name(name):
+    """优先用本机别名回放；没有别名时去掉 .safetensors 后缀。"""
+    if not isinstance(name, str):
+        return name
+    base = _norm_file(name)
+    for alias, (file, _strength) in LORA_ALIASES.items():
+        if _norm_file(file) == base:
+            return alias
+    for ext in (".safetensors", ".ckpt", ".pt", ".pth"):
+        if name.lower().endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def _match_local_files(unet, clip, vae):
+    """unet 文件名 -> (model, variant)；unet 缺失时才用 clip 兜底。"""
+    model = variant = None
+    if unet:
+        hits = _unet_index().get(_norm_file(unet))
+        if hits:
+            model, variant = hits[0]
+    elif clip and clip.get("clip_name"):
+        hits = _clip_index().get(_norm_file(clip["clip_name"]))
+        if hits and len({h[0] for h in hits}) == 1:
+            model = hits[0][0]
+            variant = MODELS[model].get("default_variant")
+    return model, variant
+
+
+def _clip_ok(model, clip):
+    if not clip:
+        return True
+    expected = MODELS[model].get("clip") or {}
+    if _norm_file(clip.get("clip_name")) != _norm_file(
+            expected.get("clip_name")):
+        return False
+    if clip.get("type") and expected.get("type") and \
+            clip["type"] != expected["type"]:
+        return False
+    return True
+
+
+def _known_vaes(model):
+    cfg = MODELS[model]
+    values = {cfg.get("vae")}
+    for preset in (cfg.get("presets") or {}).values():
+        if preset.get("vae"):
+            values.add(preset["vae"])
+    return {_norm_file(v) for v in values if v}
+
+
+def _vae_ok(model, vae):
+    if not vae:
+        return True
+    return _norm_file(vae) in _known_vaes(model)
+
+
+def _comfy_recipe(graph):
+    if isinstance(graph, str):
+        try:
+            graph = json.loads(graph)
+        except ValueError:
+            graph = {}
+    if not isinstance(graph, dict):
+        graph = {}
+
+    samplers = _first_node(graph, {"KSampler", "KSamplerAdvanced"})
+    first = second = None
+    for _n, _nid, node in samplers:
+        if _find_upstream(graph, (node.get("inputs") or {}).get("latent_image"),
+                          {"EmptyLatentImage"}):
+            first = node
+            break
+    if first is None and samplers:
+        first = samplers[0][2]
+    for _n, _nid, node in samplers:
+        if node is first:
+            continue
+        if _find_upstream(graph, (node.get("inputs") or {}).get("latent_image"),
+                          {"LatentUpscaleBy", "VAEEncode",
+                           "VAEEncodeTiled", "SetLatentNoiseMask"}):
+            second = node
+            break
+    if second is None:
+        for _n, _nid, node in samplers:
+            if node is not first:
+                second = node
+                break
+
+    unet_nodes = _first_node(graph, {"UNETLoader", "CheckpointLoaderSimple"})
+    unet = None
+    if unet_nodes:
+        ui = unet_nodes[0][2].get("inputs") or {}
+        unet = ui.get("unet_name") or ui.get("ckpt_name")
+
+    clip_nodes = _first_node(graph, {"CLIPLoader"})
+    clip = None
+    if clip_nodes:
+        ci = clip_nodes[0][2].get("inputs") or {}
+        clip = {"clip_name": ci.get("clip_name"), "type": ci.get("type")}
+
+    vae_nodes = _first_node(graph, {"VAELoader"})
+    vae = None
+    if vae_nodes:
+        vae = (vae_nodes[0][2].get("inputs") or {}).get("vae_name")
+
+    model, variant = _match_local_files(unet, clip, vae)
+    inputs = (first or {}).get("inputs") or {}
+    brief = _sampler_brief(first)
+    width, height = _first_pass_size(graph, first)
+    pass1 = dict(width=width, height=height, **brief)
+    pass1.pop("seed", None)
+
+    pass2 = None
+    if second is not None:
+        pass2 = _sampler_brief(second)
+        pass2.pop("seed", None)
+        pass2.update(_upscale_info(graph, second))
+
+    loras = []
+    for node in _collect_loras(graph, first):
+        li = node.get("inputs") or {}
+        name = li.get("lora_name")
+        strength = _num(li.get("strength_model"))
+        if strength is None:
+            strength = _num(li.get("strength"))
+        if name:
+            loras.append({"name": _file_to_lora_name(name),
+                          "strength": 1.0 if strength is None else strength})
+
+    save = _first_node(graph, {"SaveImage"})
+    prefix = None
+    if save:
+        prefix = (save[0][2].get("inputs") or {}).get("filename_prefix")
+
+    missing_models = []
+    if unet and model is None:
+        missing_models.append(str(unet))
+    if clip and clip.get("clip_name"):
+        if model is None or not _clip_ok(model, clip):
+            missing_models.append(str(clip["clip_name"]))
+    if vae and (model is None or not _vae_ok(model, vae)):
+        missing_models.append(str(vae))
+    upscaler = (pass2 or {}).get("upscale")
+    if upscaler and _norm_file(upscaler) not in _known_upscale_models():
+        missing_models.append(str(upscaler))
+    known_nodes = _known_node_classes()
+    for nid, node in graph.items():
+        if not isinstance(node, dict):
+            continue
+        cls = node.get("class_type")
+        if cls and cls not in known_nodes:
+            missing_models.append(f"node:{cls}")
+
+    if model:
+        if (clip and not _clip_ok(model, clip)) or (vae and not _vae_ok(model, vae)):
+            confidence = "partial"
+        else:
+            confidence = "exact"
+    elif clip or vae:
+        confidence = "partial"
+    else:
+        confidence = "none"
+
+    recipe = {
+        "model": model,
+        "variant": variant,
+        "confidence": confidence,
+        "unet": unet,
+        "clip": clip,
+        "vae": vae,
+        "seed": brief.get("seed"),
+        "pass1": pass1,
+        "pass2": pass2,
+        "loras": loras,
+        "positive": _text_from_link(graph, inputs.get("positive")),
+        "negative": _text_from_link(graph, inputs.get("negative")),
+        "prompt_prefix": prefix,
+    }
+    if missing_models:
+        recipe["missing_models"] = sorted(set(missing_models))
+    return recipe
+
+
+def recipes_from_comfy_api(graph):
+    """从 ComfyUI SaveImage 写入的 API 图（prompt 块）反解配方。"""
+    return _comfy_recipe(graph)
+
+
+def _split_a1111_params(text):
+    parts = re.split(r",\s*(?=[A-Za-z][A-Za-z0-9 _()+\-]{0,32}:)", text or "")
+    out = {}
+    for part in parts:
+        key, sep, value = part.partition(":")
+        if sep and key.strip():
+            out[key.strip().lower()] = value.strip()
+    return out
+
+
+_A1111_SAMPLERS = {
+    "euler a": "euler_ancestral", "euler": "euler",
+    "lms": "lms", "heun": "heun", "dpm2": "dpm_2",
+    "dpm2 a": "dpm_2_ancestral", "dpm++ 2m": "dpmpp_2m",
+    "dpm++ 2m karras": "dpmpp_2m", "dpm++ sde": "dpmpp_sde",
+    "dpm++ sde karras": "dpmpp_sde", "ddim": "ddim", "unipc": "uni_pc",
+}
+
+
+def _a1111_sampler(text):
+    raw = (text or "").strip().lower()
+    return _A1111_SAMPLERS.get(raw, (text or "").strip() or None)
+
+
+def _a1111_scheduler(sampler, schedule):
+    if schedule:
+        s = schedule.strip().lower()
+        if s in ("karras", "exponential", "sgm uniform", "simple",
+                 "normal", "ddim uniform", "beta"):
+            return s.replace(" ", "_")
+    if "karras" in (sampler or "").lower():
+        return "karras"
+    return "normal"
+
+
+def _int_from(value):
+    m = re.search(r"-?\d+", str(value or ""))
+    return int(m.group(0)) if m else None
+
+
+def _float_from(value):
+    m = re.search(r"-?(?:\d+\.\d+|\d+)", str(value or ""))
+    return float(m.group(0)) if m else None
+
+
+def _match_model_name(raw):
+    if not raw:
+        return None, None
+    text = str(raw).strip()
+    if text.lower() in MODELS:
+        model = text.lower()
+        return model, MODELS[model].get("default_variant")
+    norm = _norm_file(text)
+    if norm in MODELS:
+        return norm, MODELS[norm].get("default_variant")
+    hits = _unet_index().get(norm)
+    if hits:
+        return hits[0]
+    for model, cfg in MODELS.items():
+        if _norm_file(cfg.get("display")) == norm:
+            return model, cfg.get("default_variant")
+    return None, None
+
+
+def recipes_from_a1111(text):
+    """解析 A1111/Forge 的 parameters 文本。字段缺失时降级为 None。"""
+    text = text or ""
+    lines = text.splitlines()
+    neg_idx = steps_idx = None
+    for i, line in enumerate(lines):
+        if neg_idx is None and line.startswith("Negative prompt:"):
+            neg_idx = i
+        if re.match(r"^\s*Steps:\s*", line):
+            steps_idx = i
+            break
+
+    positive = ""
+    negative = ""
+    if neg_idx is not None:
+        positive = "\n".join(lines[:neg_idx]).strip()
+        end = steps_idx if steps_idx is not None and steps_idx >= neg_idx else len(lines)
+        neg_lines = [lines[neg_idx][len("Negative prompt:"):].strip()]
+        neg_lines += lines[neg_idx + 1:end]
+        negative = "\n".join(neg_lines).strip()
+    elif steps_idx is not None:
+        positive = "\n".join(lines[:steps_idx]).strip()
+    else:
+        positive = text.strip()
+
+    params_line = "\n".join(lines[steps_idx:]) if steps_idx is not None else ""
+    params = _split_a1111_params(params_line)
+
+    model_raw = params.get("model") or params.get("model name")
+    model, variant = _match_model_name(model_raw)
+    if model is None and model_raw:
+        # 模型名里带路径/扩展名时，再用 unet 文件名做一次精确比对
+        model, variant = _match_model_name(_norm_file(model_raw))
+
+    size_w = size_h = None
+    m = re.search(r"(\d+)\s*[xX\u00d7]\s*(\d+)", params.get("size") or "")
+    if m:
+        size_w, size_h = int(m.group(1)), int(m.group(2))
+
+    steps = _int_from(params.get("steps"))
+    cfg = _float_from(params.get("cfg scale"))
+    seed = _int_from(params.get("seed"))
+    sampler_raw = params.get("sampler")
+    sampler = _a1111_sampler(sampler_raw)
+    scheduler = _a1111_scheduler(sampler_raw, params.get("schedule type"))
+    denoise = _float_from(params.get("denoising strength"))
+
+    pass1 = dict(width=size_w, height=size_h, steps=steps, cfg=cfg,
+                 sampler=sampler, scheduler=scheduler,
+                 denoise=1.0 if denoise is None else denoise)
+    loras = []
+    for lm in re.finditer(r"<lora:([^:>]+):([^>]+)>", positive):
+        strength = _float_from(lm.group(2))
+        loras.append({"name": _file_to_lora_name(lm.group(1).strip()),
+                      "strength": 1.0 if strength is None else strength})
+
+    pass2 = None
+    hires_scale = _float_from(params.get("hires upscale"))
+    if hires_scale or denoise is not None:
+        pass2 = dict(steps=_int_from(params.get("hires steps")) or steps,
+                     cfg=cfg, sampler=sampler, scheduler=scheduler,
+                     denoise=denoise)
+        if hires_scale:
+            pass2["scale_by"] = hires_scale
+        if params.get("hires upscaler"):
+            pass2["upscale"] = params["hires upscaler"]
+            pass2["upscale_mode"] = "pixel"
+
+    recipe = {
+        "model": model,
+        "variant": variant,
+        "confidence": "exact" if model else "none",
+        "unet": None,
+        "clip": None,
+        "vae": params.get("vae"),
+        "seed": seed,
+        "pass1": pass1,
+        "pass2": pass2,
+        "loras": loras,
+        "positive": positive,
+        "negative": negative,
+        "prompt_prefix": None,
+    }
+    if model_raw and model is None:
+        recipe["model"] = model_raw
+        recipe["model_raw"] = model_raw
+        recipe["missing"] = ["model"]
+    vae = params.get("vae")
+    if model and vae and _norm_file(vae) not in _known_vaes(model):
+        recipe["missing"] = sorted(set(recipe.get("missing", []) + ["vae"]))
+        recipe["confidence"] = "partial"
+    return recipe
+
+
+def recipes_from_novelai(obj):
+    obj = obj or {}
+    prompt = obj.get("prompt") or ""
+    negative = obj.get("uc") or ""
+    steps = _num(obj.get("steps"))
+    cfg = _num(obj.get("scale"))
+    seed = _num(obj.get("seed"))
+    sampler = obj.get("sampler")
+    scheduler = obj.get("noise_schedule")
+    size = {"width": _num(obj.get("width")),
+            "height": _num(obj.get("height"))}
+    return {
+        "model": None, "variant": None, "confidence": "none",
+        "unet": None, "clip": None, "vae": None, "seed": seed,
+        "pass1": dict(width=size["width"], height=size["height"],
+                      steps=steps, cfg=cfg, sampler=sampler,
+                      scheduler=scheduler, denoise=1.0),
+        "pass2": None, "loras": [], "positive": prompt,
+        "negative": negative, "prompt_prefix": None,
+        "missing": ["model"],
+    }
+
+
+def recipes_from_fooocus(obj):
+    obj = obj or {}
+    prompt = obj.get("prompt") or ""
+    negative = obj.get("negative_prompt") or ""
+    steps = _num(obj.get("steps"))
+    cfg = _num(obj.get("guidance_scale"))
+    seed = _num(obj.get("seed"))
+    model_raw = obj.get("base_model") or obj.get("model")
+    model, variant = _match_model_name(model_raw)
+    width = _num(obj.get("width"))
+    height = _num(obj.get("height"))
+    recipe = {
+        "model": model, "variant": variant,
+        "confidence": "exact" if model else "none",
+        "unet": None, "clip": None, "vae": obj.get("vae"),
+        "seed": seed,
+        "pass1": dict(width=width, height=height, steps=steps, cfg=cfg,
+                      sampler=obj.get("sampler"),
+                      scheduler=obj.get("scheduler"), denoise=1.0),
+        "pass2": None, "loras": [], "positive": prompt,
+        "negative": negative, "prompt_prefix": None,
+    }
+    if model_raw and model is None:
+        recipe["model"] = model_raw
+        recipe["model_raw"] = model_raw
+        recipe["missing"] = ["model"]
+    return recipe
+
+
+def _eq(a, b, tol=1e-6):
+    if a is None or b is None:
+        return a is b
+    try:
+        return abs(float(a) - float(b)) <= tol
+    except (TypeError, ValueError):
+        return a == b
+
+
+def _preset_match(model, recipe):
+    cfg = MODELS.get(model)
+    if not cfg:
+        return None, "模型不在本机 MODELS"
+    p1 = recipe.get("pass1") or {}
+    p2 = recipe.get("pass2")
+    for name, preset in (cfg.get("presets") or {}).items():
+        if not (_eq(p1.get("width"), preset.get("width"))
+                and _eq(p1.get("height"), preset.get("height"))
+                and _eq(p1.get("steps"), preset.get("steps"))
+                and _eq(p1.get("cfg"), preset.get("cfg"))
+                and p1.get("sampler") == preset.get("sampler")
+                and p1.get("scheduler") == preset.get("scheduler")
+                and _eq(p1.get("denoise"), preset.get("denoise"))):
+            continue
+        want_two = bool(preset.get("two_pass"))
+        if want_two:
+            if not p2:
+                continue
+            if not (_eq(p2.get("steps"), preset.get("steps2"))
+                    and _eq(p2.get("cfg"), preset.get("cfg"))
+                    and p2.get("sampler") == preset.get("sampler")
+                    and p2.get("scheduler") == preset.get("scheduler")
+                    and _eq(p2.get("denoise"), preset.get("denoise2"))):
+                continue
+            mode = preset.get("upscale_mode", "latent")
+            if p2.get("upscale_mode", "latent") != mode:
+                continue
+            if mode == "pixel":
+                ratio = float(preset.get("upscale_ratio", 2.0) or 2.0)
+                expected_by = float(preset.get("scale", 1)) / ratio
+                if not _eq(p2.get("scale_by"), expected_by):
+                    continue
+                if preset.get("upscale_model") and _norm_file(
+                        p2.get("upscale")) != _norm_file(
+                            preset["upscale_model"]):
+                    continue
+            elif not _eq(p2.get("scale_by"), preset.get("scale")):
+                continue
+            preset_vae = preset.get("vae")
+            if preset_vae and recipe.get("vae") and _norm_file(
+                    recipe["vae"]) != _norm_file(preset_vae):
+                continue
+        elif p2:
+            continue
+        return name, None
+    if p2:
+        return None, "二采链路与本机任何 preset 都不一致"
+    return None, "steps/cfg 与本机任何 preset 都不一致"
+
+
+def _fmt_num(value):
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _build_replay(recipe, preset_name):
+    model = recipe.get("model")
+    unmapped = []
+    notes = []
+    if model not in MODELS:
+        return ({"args": [],
+                 "note": "模型不在本机 MODELS，无法生成可执行的 replay"},
+                ["model"], [])
+    cfg = MODELS[model]
+    args = ["-m", model]
+    variant = recipe.get("variant")
+    if variant and variant != cfg.get("default_variant"):
+        args += ["--variant", variant]
+
+    p1 = recipe.get("pass1") or {}
+    p2 = recipe.get("pass2")
+    if preset_name:
+        if preset_name != DEFAULT_PRESET.get(model):
+            args += ["--preset", preset_name]
+    else:
+        width, height = p1.get("width"), p1.get("height")
+        if width and height:
+            width, height = int(width), int(height)
+            if (width % 64 == 0 and height % 64 == 0
+                    and width * height <= 2048 * 2048):
+                args += ["--size", f"{width}x{height}"]
+            else:
+                unmapped.append("size")
+        base_steps = cfg.get("custom_steps", 8)
+        if p1.get("steps") is not None and not _eq(p1["steps"], base_steps):
+            args += ["--steps", str(int(p1["steps"]))]
+        if p1.get("cfg") is not None and not _eq(p1["cfg"], 1.0):
+            args += ["--cfg", _fmt_num(p1["cfg"])]
+        if p1.get("denoise") is not None and not _eq(p1["denoise"], 1.0):
+            args += ["--denoise", _fmt_num(p1["denoise"])]
+        if p2:
+            unmapped.extend(["pass2.steps", "pass2.denoise", "pass2.scale"])
+            if p2.get("upscale"):
+                unmapped.append("pass2.upscale")
+            notes.append("二采链路没有命中本机 preset，无法用单采参数复现")
+
+    if p1.get("sampler") and p1["sampler"] != "euler":
+        unmapped.append("sampler")
+    if p1.get("scheduler") and p1["scheduler"] != "simple":
+        unmapped.append("scheduler")
+
+    vae = recipe.get("vae")
+    if vae:
+        preset = cfg["presets"].get(preset_name or "") or {}
+        accepted = {_norm_file(cfg.get("vae")), _norm_file(preset.get("vae"))}
+        accepted.discard("")
+        if _norm_file(vae) not in accepted:
+            if _norm_file(vae) in _known_vaes(model):
+                args += ["--vae", vae]
+            else:
+                unmapped.append("vae")
+
+    if recipe.get("negative"):
+        args += ["--negative", recipe["negative"]]
+
+    default_lora = _norm_file(cfg.get("default_lora"))
+    max_steps = cfg.get("default_lora_max_steps", 8)
+    for item in recipe.get("loras") or []:
+        name = item.get("name")
+        if not name:
+            continue
+        if default_lora and _norm_file(name) == default_lora:
+            steps = p1.get("steps")
+            if steps is None or steps <= max_steps:
+                continue
+        strength = item.get("strength")
+        args += ["--lora", name if strength is None
+                 else f"{name}:{_fmt_num(strength)}"]
+
+    if recipe.get("seed") is not None:
+        args += ["--seed", str(int(recipe["seed"]))]
+
+    replay = {"args": args}
+    if notes:
+        replay["note"] = "; ".join(notes)
+    return replay, unmapped, []
+
+
+def inspect_image(path):
+    """返回 (payload, exit_code)，纯只读，不触发任何生成。"""
+    info = parse_metadata(path)
+    if not info.get("ok"):
+        err = info.get("error") or "no_metadata"
+        payload = {"ok": False, "error": err}
+        if err != "no_metadata":
+            payload["image"] = info.get("image")
+        return payload, 2
+
+    source = info.get("source")
+    if source == "comfyui":
+        recipe = recipes_from_comfy_api(info.get("comfy_api"))
+    elif source == "a1111":
+        recipe = recipes_from_a1111(info.get("a1111"))
+    elif source == "novelai":
+        recipe = recipes_from_novelai(info.get("comment"))
+    else:
+        recipe = recipes_from_fooocus(info.get("fooocus"))
+
+    model = recipe.get("model")
+    preset_name, preset_reason = _preset_match(model, recipe)
+    replay, unmapped, _ = _build_replay(recipe, preset_name)
+
+    missing = list(recipe.pop("missing", []) or [])
+    missing_models = list(recipe.pop("missing_models", []) or [])
+    if model in MODELS and not preset_name:
+        missing.append("preset")
+
+    if model not in MODELS:
+        matches_local = None
+    else:
+        matches_local = {"preset": preset_name}
+        if preset_reason:
+            matches_local["reason"] = preset_reason
+
+    payload = {
+        "ok": True,
+        "image": info["image"],
+        "source": source,
+        "size": info.get("size"),
+        "recipe": recipe,
+        "matches_local": matches_local,
+        "missing": sorted(set(missing)),
+        "unmapped": sorted(set(unmapped)),
+        "replay": replay,
+        "raw": info.get("raw") or {},
+    }
+    if missing_models:
+        payload["missing_models"] = sorted(set(missing_models))
+    return payload, (4 if missing_models else 0)
+
+
+def _inspect_parser():
+    class JsonParser(argparse.ArgumentParser):
+        def error(self, message):
+            fail(2, "bad_args", message, "运行 imggen --list 查看完整能力清单")
+
+    ap = JsonParser(prog="imggen inspect",
+                    description="从图片元数据反解 imggen 配方（只读）")
+    ap.add_argument("images", nargs="+", metavar="IMAGE")
+    return ap
+
+
+def do_inspect(argv):
+    a = _inspect_parser().parse_args(argv)
+    results = []
+    codes = []
+    for path in a.images:
+        payload, code = inspect_image(path)
+        results.append(payload)
+        codes.append(code)
+    if len(results) == 1:
+        emit(results[0])
+        return codes[0]
+    ok = all(r.get("ok") for r in results)
+    emit({"ok": ok, "results": results,
+          **({"error": "some_images_failed"} if not ok else {})})
+    return max(codes)
+
+
+# ----------------------------------------------------------------------------
 # 尺寸 / 参数
 # ----------------------------------------------------------------------------
 def round64(v):
@@ -1544,6 +2878,7 @@ def do_list():
             'imggen -m krea2 --inpaint 成片.png --mask mask.png "描述"',
             'imggen -m krea2 --anypaint 成片.png --rect 600,500,400,450 "描述"',
             'imggen -m krea2 --anypaint 成片.png --mask mask.png --anypaint-sr "描述"',
+            'imggen inspect 成片.png',
         ],
         "exit_codes": {"0": "成功", "2": "参数错误", "3": "服务不可用",
                        "4": "内存不足", "5": "提交被拒", "6": "执行失败或超时"},
@@ -1642,18 +2977,27 @@ def build_parser():
     ap.add_argument("--allow-format-mismatch", action="store_true",
                     help="模型不支持该提示词形态时仍然发送（逃生通道）")
     ap.add_argument("--dry", action="store_true", help="只打印 API graph")
+    ap.add_argument("--inspect", action="append", default=[], metavar="IMAGE",
+                    help="从图片元数据反解配方（只读，可重复）")
     ap.add_argument("--list", action="store_true", help="输出 JSON 能力清单")
     return ap
 
 
-def main():
-    a = build_parser().parse_args()
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "inspect":
+        return do_inspect(argv[1:])
+
+    a = build_parser().parse_args(argv)
     a.native_snapped = False
     a.requested_aspect = None
 
     if a.list:
         do_list()
         return 0
+
+    if a.inspect:
+        return do_inspect(a.inspect)
 
     if a.native and (a.edit or a.inpaint or a.anypaint):
         fail(2, "bad_args",
