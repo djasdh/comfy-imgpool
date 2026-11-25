@@ -1172,6 +1172,38 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": True, "job": job,
                                         "prev": prev, "next": next_,
                                         "queue": POOL.queue_snapshot()})
+            if u.path == "/inspect":
+                body = self._body()
+                path = body.get("path") or body.get("image")
+                jid = body.get("id")
+                if jid:
+                    job = POOL.jobs.get(jid)
+                    if not job:
+                        return self._send(404, {"ok": False,
+                                                "error": "not_found",
+                                                "id": jid})
+                    images = (job.get("result") or {}).get("images") or []
+                    try:
+                        idx = int(body.get("index", 0))
+                    except (TypeError, ValueError):
+                        idx = 0
+                    if idx < 0 or idx >= len(images):
+                        return self._send(409, {
+                            "ok": False, "error": "no_such_image",
+                            "id": jid, "index": idx,
+                            "message": "任务还没有可用图片"})
+                    path = images[idx]
+                if not path:
+                    raise SubmissionError({
+                        "ok": False, "error": "bad_args",
+                        "message": "需要 path/image，或已有任务的 id"})
+                mod = _imggen_module()
+                payload, code = mod.inspect_image(path)
+                if payload.get("ok"):
+                    return self._send(200, payload)
+                status = (404 if payload.get("error") == "file_not_found"
+                          else 422)
+                return self._send(status, payload)
             if u.path == "/cancel":
                 body = self._body()
                 jid = body.get("id", "")
@@ -1601,6 +1633,36 @@ def cmd_submit(a):
     return cmd_wait(a, job["id"], r["job"])
 
 
+def cmd_inspect(a):
+    if a.id:
+        if not _require_daemon():
+            return 3
+        spec = {"id": a.id, "index": getattr(a, "index", 0)}
+        try:
+            r = cpost("/inspect", spec, timeout=60)
+        except urllib.error.HTTPError as e:
+            try:
+                body = json.loads(e.read().decode())
+            except Exception:
+                body = {"ok": False, "error": f"http_{e.code}"}
+            body.setdefault("ok", False)
+            emit(body)
+            return 2 if e.code < 500 else 3
+        emit(r)
+        if not r.get("ok"):
+            return 2
+        return 4 if r.get("missing_models") else 0
+    if not a.image:
+        emit({"ok": False, "error": "bad_args",
+              "message": "需要图片路径，或用 --id 指定已有任务",
+              "hint": "imgpool inspect IMAGE；imgpool inspect --id job_x"})
+        return 2
+    mod = _imggen_module()
+    payload, code = mod.inspect_image(os.path.abspath(a.image))
+    emit(payload)
+    return code
+
+
 def cmd_wait(a, jid=None, first=None):
     jid = jid or a.id
     t0 = time.time()
@@ -1925,6 +1987,11 @@ def build_parser():
     p.add_argument("--id", required=True)
     p.add_argument("--timeout", type=int, default=1800)
 
+    p = sub.add_parser("inspect", help="从图片元数据反解出图配方（只读）")
+    p.add_argument("image", nargs="?", help="本机图片路径")
+    p.add_argument("--id", help="已有任务 id；默认取该任务第一张图")
+    p.add_argument("--index", type=int, default=0, help="任务结果里的图片序号")
+
     p = sub.add_parser("status", help="当前排队；带 --id 查单个任务")
     p.add_argument("--id")
 
@@ -1961,6 +2028,8 @@ def main():
         return cmd_submit(a)
     if a.cmd == "wait":
         return cmd_wait(a)
+    if a.cmd == "inspect":
+        return cmd_inspect(a)
     if a.cmd == "status":
         return cmd_status(a)
     if a.cmd == "result":

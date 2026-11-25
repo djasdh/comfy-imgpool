@@ -95,6 +95,94 @@ imgpool cancel --id job_... --source agent-a
 imgpool stop                                                 # refuses if jobs are running
 ```
 
+## Reverse lookup: read a recipe from an image
+
+`imggen inspect` is the read-only opposite of generation. It reads the metadata
+that the image producer already stored and maps it back onto this machine's
+`MODELS` table. It never talks to ComfyUI, never executes a workflow, and never
+writes a file.
+
+```bash
+imggen inspect out.png                  # one JSON object
+imggen inspect a.png b.png              # one JSON object with a results array
+imggen --inspect out.png                # same, flag form
+imgpool inspect out.png                 # via the pool CLI (no job needed)
+imgpool inspect --id job_20261120_...   # first image of an existing job
+```
+
+The JSON follows the same one-object-on-stdout contract as generation:
+
+```json
+{
+  "ok": true,
+  "image": "/abs/path/out.png",
+  "source": "comfyui",
+  "size": {"width": 1536, "height": 1024},
+  "recipe": {
+    "model": "moss", "variant": "sft-int8", "confidence": "exact",
+    "unet": "moss_image_sft_int8_convrot.safetensors",
+    "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image"},
+    "vae": "flux2-vae.safetensors", "seed": 424242,
+    "pass1": {"width": 1024, "height": 1024, "steps": 4, "cfg": 1.0,
+              "sampler": "euler", "scheduler": "simple", "denoise": 1.0},
+    "pass2": null, "loras": [],
+    "positive": "...", "negative": "", "prompt_prefix": "imggen_moss_..."
+  },
+  "matches_local": {"preset": "1024"},
+  "missing": [],
+  "unmapped": [],
+  "replay": {"args": ["-m", "moss", "--seed", "424242"]},
+  "raw": {"prompt": "..."}
+}
+```
+
+- `confidence`: `exact` when the UNET/CLIP/VAE file names identify a local
+  model and variant, `partial` when only some files match, `none` otherwise.
+- `matches_local`: the preset whose full sampler/two-pass combination matches;
+  `preset` is `null` with a `reason` when the model is local but the recipe is
+  not. It is `null` entirely when the model is not in `MODELS`.
+- `missing` / `unmapped` / `missing_models`: anything the parser could not map
+  is listed explicitly instead of being guessed.
+- `replay.args` can be passed back to `imggen` (prompt fields are in
+  `recipe.positive` / `recipe.negative`). When a local preset matches, replay
+  uses `--preset`; otherwise it emits the mappable custom size/steps/cfg/seed
+  and lists unsupported two-pass or sampler fields under `unmapped`.
+
+Formats and dispatch rules:
+
+- ComfyUI PNG `tEXt`/`iTXt`: the **API graph** in the `prompt` block is the
+  source of truth. The UI graph in `workflow` is deliberately ignored, because
+  widgets that have been converted to inputs can retain stale values from a
+  previous run.
+- A1111/Forge: `parameters` text (PNG) or EXIF `UserComment`/`ImageDescription`
+  (JPEG/WebP), including prompt, negative prompt, Steps, Sampler, CFG, Seed,
+  Size, Model and VAE.
+- NovelAI `Comment` JSON and Fooocus JSON are recognized where present.
+- XMP is preserved and used as a fallback for A1111-style `parameters`.
+- Images with no recognized metadata return `{"ok": false,
+  "error": "no_metadata"}` and exit code `2`; nothing is guessed.
+
+The HTTP side exposes the same payload for agents that do not run shell
+commands:
+
+```bash
+curl -s -X POST http://127.0.0.1:8199/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{"path": "/abs/path/out.png"}'
+
+curl -s -X POST http://127.0.0.1:8199/inspect \
+  -H 'Content-Type: application/json' \
+  -d '{"id": "job_20261120_004606_abc123", "index": 0}'
+```
+
+### What destroys metadata
+
+Embedded recipes only survive lossless, file-preserving transfers. They are
+gone after Telegram photo channels, WeChat, screenshots, re-encoding, format
+conversion, most image editors, and any resize/crop pipeline. Keep the original
+PNG/JPEG if you may want to replay it later; `inspect` cannot and does not try
+to recover a recipe from pixels alone.
+
 ## JSON contract
 
 Success (`imggen`):
