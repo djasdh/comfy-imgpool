@@ -6,6 +6,7 @@
 所有加速细节（int8/int4、HIP attention、二采、VAE 选择、内存保护）都封装在这里。
 
   imggen --list                                   # JSON 能力清单
+  imggen --workflow moss-1024 "提示词"             # 声明式工作流（绑定单模型）
   imggen "提示词"                                  # 默认 moss / 1024² / 4 步
   imggen -m anima "提示词"                         # 1024→1536 二采，12 秒
   imggen -m krea2 --preset 2k "提示词"             # 1152×2048 二采，锁构图
@@ -299,6 +300,329 @@ MODELS = {
 
 DEFAULT_MODEL = "moss"
 DEFAULT_PRESET = {"moss": "1024", "anima": "fast", "krea2": "2k"}
+
+# ----------------------------------------------------------------------------
+# 声明式工作流（workflows/*.json）
+#
+# workflow 只负责「哪套图 + 哪些文件 + 哪些参数可改」，真正的节点拓扑仍由
+# TEMPLATES 里的命名模板实现。没有 --workflow 时完全不读取这些定义，
+# 保证旧调用的节点 id 与参数行为不变。
+# ----------------------------------------------------------------------------
+WORKFLOW_TEMPLATES = (
+    "single_pass", "two_pass_upscale", "two_pass_latent",
+    "edit_moss", "refine_inpaint", "anypaint_krea2",
+)
+
+# CLI flag -> workflow 字段。用于判断调用方「显式覆盖」了哪些参数。
+WORKFLOW_FLAGS = {
+    "--model": "model", "-m": "model",
+    "--variant": "variant",
+    "--preset": "preset",
+    "--vae": "vae",
+    "--size": "size",
+    "--width": "width",
+    "--height": "height",
+    "--aspect": "aspect",
+    "--native": "native",
+    "--steps": "steps",
+    "--steps2": "steps2",
+    "--cfg": "cfg",
+    "--denoise": "denoise",
+    "--denoise2": "denoise2",
+    "--scale": "scale",
+    "--latent": "latent",
+    "--vae-tiled": "vae_tiled",
+    "--lora": "lora",
+    "--lora-strength": "lora",
+    "--negative": "negative",
+    "--negative-file": "negative",
+    "--seed": "seed",
+    "--edit-strength": "edit_strength",
+    "--refine-denoise": "refine_denoise",
+    "--refine-level": "refine_level",
+    "--refine-pad": "refine_pad",
+    "--refine-long-edge": "refine_long_edge",
+    "--refine-feather": "refine_feather",
+    "--refine-shrink": "refine_shrink",
+    "--refine-sr-model": "refine_sr_model",
+    "--no-refine-sr": "no_refine_sr",
+    "--anypaint-boundary": "anypaint_boundary",
+    "--anypaint-ref-edge": "anypaint_ref_edge",
+    "--anypaint-sr": "anypaint_sr",
+    "--anypaint-sr-model": "anypaint_sr_model",
+}
+
+WORKFLOW_OVERRIDE_FIELDS = {
+    v for k, v in WORKFLOW_FLAGS.items() if v != "model"
+}
+
+# HTTP /submit 的结构化键与 CLI 字段名基本一致，少数别名归并到同一开关。
+WORKFLOW_KEY_ALIASES = {
+    "lora_strength": "lora",
+    "negative_file": "negative",
+}
+
+_OVERRIDE_NUMERIC = {
+    "width", "height", "steps", "steps2", "cfg", "denoise", "denoise2",
+    "scale", "seed", "edit_strength", "refine_denoise", "refine_level",
+    "refine_pad", "refine_long_edge", "refine_feather", "refine_shrink",
+    "anypaint_boundary", "anypaint_ref_edge",
+}
+
+
+def _workflow_source():
+    """工作流定义路径：IMGPOOL_WORKFLOWS > <root>/workflows。"""
+    return os.environ.get("IMGPOOL_WORKFLOWS") or os.path.join(
+        ROOT, "workflows")
+
+
+def _workflow_docs(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    if isinstance(data.get("workflows"), list):
+        return data["workflows"]
+    if isinstance(data.get("workflows"), dict):
+        return [dict(v, id=v.get("id") or k)
+                for k, v in data["workflows"].items() if isinstance(v, dict)]
+    if data.get("id"):
+        return [data]
+    return []
+
+
+def load_workflows():
+    """读取并校验 workflow 定义；坏文件跳过，不影响普通出图。"""
+    src = _workflow_source()
+    paths = []
+    if os.path.isdir(src):
+        try:
+            paths = [os.path.join(src, n) for n in sorted(os.listdir(src))
+                     if n.endswith(".json")]
+        except OSError:
+            paths = []
+    elif os.path.isfile(src):
+        paths = [src]
+    found = {}
+    for path in paths:
+        for item in _workflow_docs(path):
+            if not isinstance(item, dict):
+                continue
+            wid = item.get("id")
+            model = item.get("model")
+            graph = item.get("graph")
+            template = graph.get("template") if isinstance(graph, dict) else None
+            if (not isinstance(wid, str) or not wid
+                    or not isinstance(model, str) or model not in MODELS
+                    or template not in WORKFLOW_TEMPLATES):
+                continue
+            wf = json.loads(json.dumps(item))
+            wf["display"] = wf.get("display") or wid
+            wf["risky"] = bool(wf.get("risky", False))
+            wf.setdefault("bind", {})
+            wf.setdefault("defaults", {})
+            wf["allowed_overrides"] = list(wf.get("allowed_overrides") or [])
+            wf.setdefault("overrides", {})
+            wf["graph"] = {"template": template}
+            found[wid] = wf
+    return found
+
+
+def get_workflow(workflow_id):
+    if not isinstance(workflow_id, str):
+        return None
+    return load_workflows().get(workflow_id)
+
+
+def catalog_workflows(model=None):
+    """返回 workflow 定义表（可选按绑定模型过滤），不访问 ComfyUI。"""
+    out = []
+    for wid, wf in load_workflows().items():
+        if model and wf.get("model") != model:
+            continue
+        item = json.loads(json.dumps(wf))
+        item["id"] = wid
+        out.append(item)
+    out.sort(key=lambda w: w["id"])
+    return out
+
+
+def workflow_summary(wf):
+    return {
+        "id": wf["id"],
+        "model": wf["model"],
+        "variant": wf.get("variant"),
+        "display": wf.get("display", wf["id"]),
+        "risky": bool(wf.get("risky", False)),
+        "est_seconds": wf.get("est_seconds"),
+        "template": (wf.get("graph") or {}).get("template"),
+        "allowed_overrides": list(wf.get("allowed_overrides") or []),
+    }
+
+
+def workflow_fields_from_argv(argv):
+    """从 CLI argv 找出显式传入的 workflow 相关字段。"""
+    fields = set()
+    for token in argv:
+        key = str(token).split("=", 1)[0]
+        field = WORKFLOW_FLAGS.get(key)
+        if field:
+            fields.add(field)
+    return fields
+
+
+def workflow_fields_from_mapping(mapping):
+    """从 HTTP 结构化字段找出显式传入的 workflow 相关字段。"""
+    fields = set()
+    for key, value in (mapping or {}).items():
+        field = WORKFLOW_KEY_ALIASES.get(key, key)
+        if field == "model":
+            if value:
+                fields.add(field)
+            continue
+        if field in WORKFLOW_OVERRIDE_FIELDS and value not in (
+                None, False, "", [], {}):
+            fields.add(field)
+    return fields
+
+
+def _workflow_value(a, field):
+    if field in ("width", "height"):
+        return getattr(a, field, None)
+    return getattr(a, field, None)
+
+
+def apply_workflow(a, workflow_id, explicit=None):
+    """校验单模型绑定 / 白名单 / 区间，并把 workflow 默认值填进命名空间。"""
+    wf = get_workflow(workflow_id)
+    if wf is None:
+        available = ", ".join(sorted(load_workflows())) or "(无)"
+        fail(2, "bad_workflow", f"未知工作流 {workflow_id!r}",
+             f"可选：{available}")
+    explicit = set(explicit or ())
+    bound = wf["model"]
+
+    # model 是硬绑定：显式传入不同模型直接失败，不做静默纠正。
+    if "model" in explicit:
+        current = getattr(a, "model", None)
+        if current != bound:
+            fail(2, "bad_workflow_binding",
+                 f"工作流 {workflow_id} 绑定模型 {bound}，但请求指定了 {current}",
+                 "去掉 -m/--model，或改用绑定该模型的工作流")
+    else:
+        a.model = bound
+
+    a.workflow = workflow_id
+    a.workflow_def = wf
+    a.workflow_explicit = explicit
+
+    defaults = wf.get("defaults") or {}
+    if "variant" not in explicit and wf.get("variant"):
+        a.variant = wf["variant"]
+    for key, value in defaults.items():
+        if key in explicit:
+            continue
+        if key == "preset":
+            if getattr(a, "preset", None) is None:
+                a.preset = value
+        elif key == "negative":
+            if getattr(a, "negative", None) is None:
+                a.negative = value
+        elif key in ("size", "aspect", "width", "height", "seed", "steps",
+                     "steps2", "cfg", "denoise", "denoise2", "scale"):
+            if getattr(a, key, None) is None:
+                setattr(a, key, value)
+
+    allowed = set(wf.get("allowed_overrides") or [])
+    for field in sorted(explicit):
+        if field == "model" or field not in WORKFLOW_OVERRIDE_FIELDS:
+            continue
+        if field not in allowed:
+            hint = ("可覆盖：" + ", ".join(sorted(allowed))) if allowed \
+                else "该工作流不允许覆盖任何采样参数"
+            fail(2, "bad_override",
+                 f"工作流 {workflow_id} 不允许覆盖 {field}", hint)
+
+    for field, rule in (wf.get("overrides") or {}).items():
+        if field not in explicit or not isinstance(rule, dict):
+            continue
+        value = _workflow_value(a, field)
+        if value is None or field not in _OVERRIDE_NUMERIC:
+            continue
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            continue
+        lo, hi = rule.get("min"), rule.get("max")
+        if lo is not None and value < float(lo):
+            fail(2, "bad_override",
+                 f"工作流 {workflow_id} 的 {field} 不能小于 {lo}",
+                 rule.get("hint") or "")
+        if hi is not None and value > float(hi):
+            fail(2, "bad_override",
+                 f"工作流 {workflow_id} 的 {field} 不能大于 {hi}",
+                 rule.get("hint") or "")
+    return wf
+
+
+def apply_workflow_binding(a):
+    """把 workflow 的 bind 文件合并进当前模型配置（不碰用户显式覆盖）。"""
+    wf = getattr(a, "workflow_def", None)
+    if not wf:
+        return
+    bind = wf.get("bind") or {}
+    explicit = getattr(a, "workflow_explicit", set())
+    if isinstance(bind.get("clip"), dict):
+        a.mcfg["clip"] = json.loads(json.dumps(bind["clip"]))
+    if isinstance(bind.get("vae"), str) and "vae" not in explicit:
+        a.mcfg["vae"] = bind["vae"]
+
+
+def prepare_template_spec(wf, spec):
+    """让 spec 的采样拓扑与 workflow 的 graph.template 对齐。"""
+    template = (wf.get("graph") or {}).get("template")
+    bind = wf.get("bind") or {}
+    defaults = wf.get("defaults") or {}
+    if template == "single_pass":
+        for key in ("two_pass", "scale", "steps2", "denoise2",
+                    "upscale_mode", "upscale_model", "upscale_ratio",
+                    "latent_steps2", "latent_denoise2"):
+            spec.pop(key, None)
+    elif template in ("two_pass_upscale", "two_pass_latent"):
+        spec["two_pass"] = True
+        if "scale" not in spec:
+            spec["scale"] = defaults.get("scale", 1.5)
+        if "steps2" not in spec:
+            spec["steps2"] = defaults.get("steps2", spec.get("steps", 4))
+        if "denoise2" not in spec:
+            spec["denoise2"] = defaults.get("denoise2", 0.3)
+        if template == "two_pass_upscale":
+            spec["upscale_mode"] = "pixel"
+            spec.setdefault("upscale_ratio", 2.0)
+            if isinstance(bind.get("upscale_model"), str):
+                spec["upscale_model"] = bind["upscale_model"]
+                base = os.path.basename(bind["upscale_model"]).lower()
+                if base.startswith("4x"):
+                    spec["upscale_ratio"] = 4.0
+                elif base.startswith("2x"):
+                    spec["upscale_ratio"] = 2.0
+            elif not spec.get("upscale_model"):
+                spec["upscale_model"] = "2x-AnimeSharpV2_RPLKSR_Sharp.pth"
+        else:
+            spec["upscale_mode"] = "latent"
+            spec.pop("upscale_model", None)
+    return spec
+
+
+# 导入时快照，便于外部代码/测试直接查看；运行时校验仍走 load_workflows()，
+# 这样新增 JSON 不需要重启 imgpool。
+WORKFLOWS = load_workflows()
+
 
 # 内置 LoRA 别名 -> (文件名, 默认强度)，作为 loras/*.json 缺失时的兜底。
 # 正常路径由 _lora_meta 提供，见 LORA_ALIASES。
@@ -669,6 +993,34 @@ def build_graph(a, spec, prompt_text, edit_image):
         add(11, "VAEDecode", {"samples": last, "vae": ["4", 0]})
     add(12, "SaveImage", {"images": ["11", 0], "filename_prefix": a.out})
     return g
+
+
+def _build_text_template(a, spec, prompt_text, edit_image):
+    return build_graph(a, spec, prompt_text, edit_image)
+
+
+def _build_refine_template(a, spec, prompt_text, edit_image=None,
+                           src_name=None, mask_name=None, sample_name=None,
+                           crop=None):
+    return build_refine_graph(a, spec, prompt_text, src_name, mask_name,
+                              sample_name, crop)
+
+
+def _build_anypaint_template(a, spec, prompt_text, edit_image=None,
+                             src_name=None, mask_name=None):
+    return build_anypaint_graph(a, spec, prompt_text, src_name, mask_name)
+
+
+# 命名图拓扑。workflow 的 graph.template 只能指向这里；具体分支仍复用
+# build_graph，保证节点 id 与旧调用完全一致。
+TEMPLATES = {
+    "single_pass": _build_text_template,
+    "two_pass_upscale": _build_text_template,
+    "two_pass_latent": _build_text_template,
+    "edit_moss": _build_text_template,
+    "refine_inpaint": _build_refine_template,
+    "anypaint_krea2": _build_anypaint_template,
+}
 
 
 def build_anypaint_graph(a, spec, prompt_text, src_name, mask_name):
@@ -1487,6 +1839,9 @@ def catalog_models():
             "default_lora": cfg.get("default_lora"),
             "supports_tags": cfg.get("supports_tags", True),
             "default_variant": cfg.get("default_variant"),
+            "workflows": [
+                workflow_summary(w) for w in catalog_workflows(name)
+            ],
             "variants": [
                 {
                     "name": vname,
@@ -1521,12 +1876,16 @@ def do_list():
         "service": {"url": BASE, "up": service_up()},
         "default_model": DEFAULT_MODEL,
         "models": models,
+        "workflows": catalog_workflows(),
         "loras": loras,
         "lora_aliases": {k: {"file": v[0], "strength": v[1]}
                          for k, v in LORA_ALIASES.items()},
         "lora_groups": lora_groups(),
         "usage": [
             'imggen "提示词"',
+            'imggen --workflow moss-1024 "提示词"',
+            'imggen --workflow moss-painterly-2pass "提示词"',
+            'imggen --workflow krea2-anypaint --anypaint 成片.png --rect 600,500,400,450 "描述"',
             'imggen -m anima "提示词"',
             'imggen -m krea2 --preset 2k "提示词"',
             'imggen -m krea2 --aspect 16:9 --native "提示词"',
@@ -1565,6 +1924,8 @@ def build_parser():
     ap.add_argument("--prompt-file", help="从文件读提示词")
     ap.add_argument("-m", "--model", default=DEFAULT_MODEL,
                     help="moss / anima / krea2（默认 moss）")
+    ap.add_argument("--workflow",
+                    help="声明式工作流 id，见 --list；model 由 workflow 绑定推出")
     ap.add_argument("--variant", help="权重变体，见 --list（默认取模型自带变体）")
     ap.add_argument("--vae", help="覆盖解码器（如 MOSS 二采用 taef2）")
     ap.add_argument("--preset", help="预设名，见 --list")
@@ -1663,6 +2024,11 @@ def main():
     prompt = a.prompt_opt or a.prompt
     if a.prompt_file:
         prompt = open(a.prompt_file, encoding="utf-8").read()
+    a.workflow = getattr(a, "workflow", None)
+    a.workflow_def = None
+    if a.workflow:
+        apply_workflow(a, a.workflow,
+                       workflow_fields_from_argv(sys.argv[1:]))
     if a.negative_file:
         a.negative = open(a.negative_file, encoding="utf-8").read()
     a.negative = (a.negative or "").strip() or None
@@ -1673,6 +2039,7 @@ def main():
              "可选：" + ", ".join(sorted(MODELS)))
 
     a.mcfg = resolve_variant(a)
+    apply_workflow_binding(a)
 
     if (prompt_style == "tag" and not a.mcfg.get("supports_tags", True)
             and not a.allow_format_mismatch):
@@ -1741,6 +2108,8 @@ def main():
         preset, custom = "refine", True
     else:
         spec, preset, custom = resolve_spec(a)
+    if a.workflow_def:
+        prepare_template_spec(a.workflow_def, spec)
     if a.vae:
         spec["vae"] = a.vae
 
@@ -1770,7 +2139,35 @@ def main():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         a.out = f"imggen_{a.model}_{ts}"
 
-    if a.anypaint:
+    if a.workflow_def:
+        template = a.workflow_def["graph"]["template"]
+        if template == "edit_moss" and not a.edit:
+            fail(2, "bad_workflow_mode",
+                 f"工作流 {a.workflow} 需要 --edit 图片",
+                 "imggen --workflow " + a.workflow + " --edit 图片 \"指令\"")
+        if template == "refine_inpaint" and not a.inpaint:
+            fail(2, "bad_workflow_mode",
+                 f"工作流 {a.workflow} 需要 --inpaint 源图",
+                 "加上 --inpaint 源图 --rect/--mask")
+        if template == "anypaint_krea2" and not a.anypaint:
+            fail(2, "bad_workflow_mode",
+                 f"工作流 {a.workflow} 需要 --anypaint 源图",
+                 "加上 --anypaint 源图 --rect/--mask")
+        if template not in ("edit_moss", "refine_inpaint", "anypaint_krea2") \
+                and (a.edit or a.inpaint or a.anypaint):
+            fail(2, "bad_workflow_mode",
+                 f"工作流 {a.workflow} 是文生图模板，不能与参考图/局部编辑同用",
+                 "改用 edit_moss / refine_inpaint / anypaint_krea2 工作流")
+        if template == "anypaint_krea2":
+            graph = build_anypaint_graph(a, spec, prompt, anypaint_src,
+                                         anypaint_mask)
+        elif template == "refine_inpaint":
+            graph = build_refine_graph(a, spec, prompt, refine_src,
+                                       refine_mask, refine_sample,
+                                       refine_crop)
+        else:
+            graph = TEMPLATES[template](a, spec, prompt, edit_name)
+    elif a.anypaint:
         graph = build_anypaint_graph(a, spec, prompt, anypaint_src,
                                      anypaint_mask)
     elif a.inpaint:
@@ -1803,6 +2200,7 @@ def main():
              "actual_aspect": _aspect_label(dry_out_w, dry_out_h),
              "width": dry_w, "height": dry_h,
              "output_width": dry_out_w, "output_height": dry_out_h,
+             **({"workflow": a.workflow} if a.workflow else {}),
              **({"warnings": dry_warnings} if dry_warnings else {}),
              "spec": spec, "seed": a.seed, "graph": graph}
         if a.anypaint:
@@ -1955,6 +2353,8 @@ def main():
     # 原生档位走单采，原 preset 的耗时基准不再适用
     est = (None if a.native_snapped
            else a.mcfg["presets"].get(preset, {}).get("est_seconds"))
+    if a.workflow_def and not a.native_snapped:
+        est = a.workflow_def.get("est_seconds", est)
     # 冷启动判定：实测明显超出热态基准，或提交前显存里几乎没有模型
     cold_likely = (bool(est and elapsed > est * 1.3)
                    or (est is None and not a.native_snapped and elapsed > 20))
@@ -1989,6 +2389,7 @@ def main():
         "supports_tags": a.mcfg.get("supports_tags", True),
         "vae": spec.get("vae") or a.mcfg["vae"],
         "preset": preset,
+        **({"workflow": a.workflow} if a.workflow else {}),
         "native_snapped": bool(a.native_snapped),
         "requested_aspect": a.requested_aspect,
         "actual_aspect": _aspect_label(out_w, out_h),
