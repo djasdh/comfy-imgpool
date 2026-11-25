@@ -299,7 +299,12 @@ The response includes `pool` (`bind`, `concurrency`, `idle_stop_seconds`),
 `supports_tags`, `supports_edit`, `supports_anypaint`, `variants`,
 `native_sizes`, `notes`, and `presets[]` with `width`/`height`, `steps`, `cfg`,
 `sampler`, `scheduler`, `risky`, two-pass output dimensions and
-`estimated_seconds_hot`), plus `lora_aliases`.
+`estimated_seconds_hot`), plus `lora_aliases` and `workflows`.
+Each model also carries its bound `workflows[]` (`id`, `display`, `model`,
+`est_seconds`, `risky`).
+
+`GET /workflows` returns the declarative workflow table and accepts
+`?model=moss|anima|krea2` as a filter. It is also offline: no ComfyUI call.
 
 `POST /submit` accepts the same `model`, `source`, `prompt` and `timeout` as
 before, but model selection can now be structured instead of an opaque `args`
@@ -312,12 +317,15 @@ array:
  "prompt": "a lighthouse at dusk"}
 ```
 
-Accepted selectors: `model`, `preset`, `variant`, `size`, `aspect`,
+Accepted selectors: `model`, `workflow`, `preset`, `variant`, `size`, `aspect`,
 `width`/`height`, `steps`, `steps2`, `cfg`, `denoise`/`denoise2`, `scale`,
 `lora[]`, `seed`, `negative`, `native`, `latent`, `edit`, `inpaint`, `mask`,
 `rect`, `anypaint`, `allow_risky`, and the `refine*` / `anypaint_*` knobs.
 `aspect` is resolved server-side to concrete dimensions (including two-pass
-output size), so callers do not need to reproduce that table.
+output size), so callers do not need to reproduce that table. `workflow`
+implies the bound model and is validated before queueing: unknown id →
+`bad_workflow`, conflicting model → `bad_workflow_binding`, parameter outside
+the workflow allowlist → `bad_override`.
 
 - `args` still works unchanged for callers that need raw `imggen` flags.
   Sending `args` together with structured selectors returns
@@ -327,8 +335,8 @@ output size), so callers do not need to reproduce that table.
   queueing with `400 bad_model` / `bad_preset` / `bad_variant` / `bad_size`
   (plus `available` for model, preset and variant). A risky preset without
   `allow_risky` returns `400 risky_preset`.
-- Structured jobs echo the resolved values in `GET /job`: `cli_model`,
-  `preset`, `variant`, `size`, `width`, `height`, `output_width`,
+- Structured jobs echo the resolved values in `GET /job`: `workflow`,
+  `cli_model`, `preset`, `variant`, `size`, `width`, `height`, `output_width`,
   `output_height`, `actual_aspect`, `requested_aspect` and `native_snapped`.
 
 ## Hermes agent plugin
@@ -673,6 +681,53 @@ Mask-region values are not bit-reproducible across runs even with a fixed seed
 (mean diff ≈ 10 inside the mask, ≈ 0.3 outside): the 8-step int4 trajectory
 diverges on the boundary tokens. Pick the run you like rather than relying on
 re-running a seed.
+
+## 工作流
+
+工作流把「用哪套图」从代码分支变成可发现、可校验的数据。定义放在
+`workflows/*.json`（当前是单文件 `workflows/workflows.json`，格式与
+`loras/*.json` 一样），每个 workflow **只绑定一个模型**：
+
+```json
+{
+  "id": "moss-painterly-2pass",
+  "model": "moss",
+  "variant": "sft-int8",
+  "display": "MOSS 1024 首采 + 4xUltraSharp 像素二采（插画风）",
+  "risky": false,
+  "est_seconds": 62,
+  "graph": {"template": "two_pass_upscale"},
+  "bind": {
+    "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image"},
+    "vae": "flux2-vae.safetensors",
+    "upscale_model": "4xUltrasharp_4xUltrasharpV10.pt"
+  },
+  "defaults": {"negative": "worst quality, bad anatomy", "preset": "1024"},
+  "allowed_overrides": ["steps", "cfg", "seed", "size", "aspect", "native", "lora", "negative"],
+  "overrides": {"steps": {"min": 4, "max": 8, "hint": "超过 8 步会糊"}}
+}
+```
+
+- `model` 必填，请求里 `-m/--model` 与它冲突会以 `bad_workflow_binding`
+  失败（退出码 2），不会静默改成 workflow 绑定的模型。
+- `graph.template` 只能取内置拓扑：`single_pass`、`two_pass_upscale`、
+  `two_pass_latent`、`edit_moss`、`refine_inpaint`、`anypaint_krea2`。
+- `allowed_overrides` 是白名单：没列出的参数显式传入会得到 `bad_override`；
+  `overrides` 可再对数值参数加 `min`/`max`。
+- 不传 `--workflow` 时完全不改变旧行为；旧的 `--edit` / `--inpaint` /
+  `--anypaint` 继续可用，并分别对应 `moss-edit` / `krea2-inpaint` /
+  `krea2-anypaint`。
+
+```bash
+imggen --list                                      # models[].workflows
+imggen --workflow moss-painterly-2pass "提示词"     # model 由绑定推出
+imggen --workflow moss-1024 -m moss "提示词"
+imggen --workflow moss-1024 --dry "提示词"          # 离线看完整 graph
+```
+
+新增工作流只需要加一条 JSON；先用 `--dry` 验证生成的 graph，再检查
+`--workflow <id> -m <别的模型>` 是否按预期失败。`GET /workflows` 返回同一张
+定义表，`GET /models` 的每个模型带 `workflows[]`。
 
 ## LoRA catalog
 

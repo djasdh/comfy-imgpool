@@ -1,0 +1,227 @@
+{
+  "schema": 1,
+  "updated": "2026-11-25",
+  "workflows": [
+    {
+      "id": "moss-1024",
+      "model": "moss",
+      "variant": "sft-int8",
+      "display": "MOSS 1024 单采（默认）",
+      "risky": false,
+      "est_seconds": 9,
+      "graph": {"template": "single_pass"},
+      "bind": {
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"},
+        "vae": "flux2-vae.safetensors"
+      },
+      "defaults": {"preset": "1024"},
+      "allowed_overrides": ["steps", "cfg", "seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {
+        "steps": {"min": 1, "max": 8, "hint": "MOSS 的 4 步蒸馏 LoRA 在 8 步以内有效"}
+      }
+    },
+    {
+      "id": "moss-1280",
+      "model": "moss",
+      "variant": "sft-int8",
+      "display": "MOSS 1024 首采 + 像素二采 → 1280",
+      "risky": false,
+      "est_seconds": 24,
+      "graph": {"template": "two_pass_upscale"},
+      "bind": {
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"},
+        "vae": "taef2",
+        "upscale_model": "2x-AnimeSharpV2_RPLKSR_Sharp.pth"
+      },
+      "defaults": {"preset": "1280"},
+      "allowed_overrides": ["seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "moss-1536-2pass",
+      "model": "moss",
+      "variant": "sft-int8",
+      "display": "MOSS 1024 首采 + 像素二采 → 1536",
+      "risky": false,
+      "est_seconds": 32,
+      "graph": {"template": "two_pass_upscale"},
+      "bind": {
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"},
+        "vae": "taef2",
+        "upscale_model": "2x-AnimeSharpV2_RPLKSR_Sharp.pth"
+      },
+      "defaults": {"preset": "1536-2pass"},
+      "allowed_overrides": ["seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "moss-painterly-2pass",
+      "model": "moss",
+      "variant": "sft-int8",
+      "display": "MOSS 1024 首采 + 4xUltraSharp 像素二采（插画风）",
+      "risky": false,
+      "est_seconds": 62,
+      "graph": {"template": "two_pass_upscale"},
+      "bind": {
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"},
+        "vae": "flux2-vae.safetensors",
+        "upscale_model": "4xUltrasharp_4xUltrasharpV10.pt"
+      },
+      "defaults": {
+        "negative": "worst quality, bad anatomy",
+        "preset": "1024"
+      },
+      "allowed_overrides": ["steps", "cfg", "seed", "size", "aspect", "native", "lora", "negative"],
+      "overrides": {
+        "steps": {"min": 4, "max": 8, "hint": "该模型 4 步蒸馏 LoRA，超过 8 步会糊"}
+      }
+    },
+    {
+      "id": "moss-edit",
+      "model": "moss",
+      "variant": "sft-int8",
+      "display": "MOSS 参考图编辑（--edit 的命名形式）",
+      "risky": false,
+      "est_seconds": 15,
+      "graph": {"template": "edit_moss"},
+      "bind": {
+        "clip": {"clip_name": "qwen3.5_9b_w4a8_gptq.safetensors", "type": "moss_image", "device": "default"},
+        "vae": "flux2-vae.safetensors"
+      },
+      "defaults": {},
+      "allowed_overrides": ["seed", "steps", "cfg", "lora", "negative"],
+      "overrides": {
+        "steps": {"min": 1, "max": 8, "hint": "MOSS 编辑 LoRA 同样按 4 步蒸馏"}
+      }
+    },
+    {
+      "id": "anima-fast",
+      "model": "anima",
+      "variant": "turbo-int8",
+      "display": "Anima 1024 首采 + latent 二采 → 1536（默认）",
+      "risky": false,
+      "est_seconds": 13,
+      "graph": {"template": "two_pass_latent"},
+      "bind": {
+        "clip": {"clip_name": "qwen_3_06b_base.safetensors", "type": "stable_diffusion", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {"preset": "fast"},
+      "allowed_overrides": ["steps", "steps2", "cfg", "seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "anima-1024",
+      "model": "anima",
+      "variant": "turbo-int8",
+      "display": "Anima 1024 单采",
+      "risky": false,
+      "est_seconds": 7,
+      "graph": {"template": "single_pass"},
+      "bind": {
+        "clip": {"clip_name": "qwen_3_06b_base.safetensors", "type": "stable_diffusion", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {"preset": "1024"},
+      "allowed_overrides": ["steps", "cfg", "seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "anima-1536",
+      "model": "anima",
+      "variant": "turbo-int8",
+      "display": "Anima 1536 单采",
+      "risky": false,
+      "est_seconds": 18,
+      "graph": {"template": "single_pass"},
+      "bind": {
+        "clip": {"clip_name": "qwen_3_06b_base.safetensors", "type": "stable_diffusion", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {"preset": "1536"},
+      "allowed_overrides": ["steps", "cfg", "seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "krea2-2k",
+      "model": "krea2",
+      "variant": "int4",
+      "display": "Krea2 720x1280 首采 + 像素二采 → 2K（默认）",
+      "risky": false,
+      "est_seconds": 40,
+      "graph": {"template": "two_pass_upscale"},
+      "bind": {
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors",
+        "upscale_model": "2x-AnimeSharpV2_RPLKSR_Sharp.pth"
+      },
+      "defaults": {"preset": "2k"},
+      "allowed_overrides": ["seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "krea2-2k-direct",
+      "model": "krea2",
+      "variant": "int4",
+      "display": "Krea2 2K 单采（构图不被低分辨率首采锁死）",
+      "risky": false,
+      "est_seconds": 34,
+      "graph": {"template": "single_pass"},
+      "bind": {
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {"preset": "2k-direct"},
+      "allowed_overrides": ["seed", "size", "width", "height", "aspect", "native", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "krea2-sq2k-karras",
+      "model": "krea2",
+      "variant": "int4",
+      "display": "Krea2 方形二采（karras，1632x1632）",
+      "risky": false,
+      "est_seconds": 50,
+      "graph": {"template": "two_pass_latent"},
+      "bind": {
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {"preset": "sq2k-karras"},
+      "allowed_overrides": ["seed", "size", "width", "height", "aspect", "lora", "negative"],
+      "overrides": {}
+    },
+    {
+      "id": "krea2-inpaint",
+      "model": "krea2",
+      "variant": "int4",
+      "display": "Krea2 局部细化（--inpaint 的命名形式）",
+      "risky": false,
+      "est_seconds": 18,
+      "graph": {"template": "refine_inpaint"},
+      "bind": {
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {},
+      "allowed_overrides": ["seed", "steps", "cfg", "negative", "lora", "vae_tiled", "refine_denoise", "refine_level", "refine_pad", "refine_long_edge", "refine_feather", "refine_shrink", "refine_sr_model", "no_refine_sr"],
+      "overrides": {}
+    },
+    {
+      "id": "krea2-anypaint",
+      "model": "krea2",
+      "variant": "int4",
+      "display": "Krea2 AnyPaint 语义局部编辑（--anypaint 的命名形式）",
+      "risky": false,
+      "est_seconds": 18,
+      "graph": {"template": "anypaint_krea2"},
+      "bind": {
+        "clip": {"clip_name": "qwen3vl_4b_fp8_scaled.safetensors", "type": "krea2", "device": "default"},
+        "vae": "qwen_image_vae.safetensors"
+      },
+      "defaults": {},
+      "allowed_overrides": ["seed", "steps", "cfg", "negative", "lora", "anypaint_boundary", "anypaint_ref_edge", "anypaint_sr", "anypaint_sr_model"],
+      "overrides": {}
+    }
+  ]
+}

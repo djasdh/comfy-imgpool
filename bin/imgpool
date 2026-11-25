@@ -141,7 +141,7 @@ ASPECT_ALIASES = {
 }
 
 STRUCTURED_KEYS = {
-    "model", "preset", "variant", "vae", "size", "aspect", "width", "height",
+    "model", "workflow", "preset", "variant", "vae", "size", "aspect", "width", "height",
     "steps", "steps2", "cfg", "denoise", "denoise2", "scale", "seed",
     "negative", "lora", "lora_strength", "native", "latent", "edit",
     "edit_strength", "inpaint", "mask", "rect", "out", "anypaint",
@@ -275,7 +275,11 @@ def _resolve_plan(mod, ns, model):
     """Reuse imggen's validators and return (spec, preset, metadata)."""
     try:
         ns.mcfg = _imggen_call(mod.resolve_variant, ns)
+        if getattr(ns, "workflow_def", None):
+            _imggen_call(mod.apply_workflow_binding, ns)
         resolved, preset, custom = _imggen_call(mod.resolve_spec, ns)
+        if getattr(ns, "workflow_def", None):
+            _imggen_call(mod.prepare_template_spec, ns.workflow_def, resolved)
         if getattr(ns, "lora", None):
             try:
                 ns.loras = _imggen_call(mod.resolve_loras, ns)
@@ -353,9 +357,20 @@ def _prepare_submission(raw):
         # Parse/validate the raw args with imggen's own parser and resolvers,
         # but keep the original argv untouched when the job runs.
         parsed = _imggen_call(mod.build_parser().parse_args, args)
+        if getattr(parsed, "workflow", None):
+            _imggen_call(mod.apply_workflow, parsed, parsed.workflow,
+                         mod.workflow_fields_from_argv(args))
         parsed_model = getattr(parsed, "model", mod.DEFAULT_MODEL)
         body_model = spec.get("model")
         if body_model and body_model != parsed_model:
+            if getattr(parsed, "workflow", None):
+                raise SubmissionError({
+                    "ok": False, "error": "bad_workflow_binding",
+                    "message": (f"工作流 {parsed.workflow} 绑定模型 "
+                                f"{parsed_model}，但请求指定了 {body_model}"),
+                    "workflow": parsed.workflow,
+                    "bound_model": parsed_model,
+                })
             raise SubmissionError({
                 "ok": False, "error": "conflicting_args",
                 "message": "args 与结构化字段不能同时使用：model",
@@ -374,6 +389,7 @@ def _prepare_submission(raw):
         return {
             "model": parsed_model,
             "cli_model": parsed_model,
+            "workflow": getattr(parsed, "workflow", None),
             "source": spec.get("source") or "cli",
             "prompt": (spec.get("prompt") or getattr(parsed, "prompt_opt", None)
                        or getattr(parsed, "prompt", None) or ""),
@@ -384,20 +400,15 @@ def _prepare_submission(raw):
 
     mod = _imggen_module()
     requested_model = spec.get("model") or mod.DEFAULT_MODEL
-    if not isinstance(requested_model, str) or requested_model not in mod.MODELS:
-        available = list(mod.MODELS)
-        raise SubmissionError({
-            "ok": False, "error": "bad_model",
-            "message": f"未知模型 {requested_model!r}",
-            "available": available,
-            "hint": " / ".join(available),
-        })
 
     def get(key, default=None):
         return spec.get(key, default)
 
     ns = argparse.Namespace(
         model=requested_model,
+        workflow=get("workflow"),
+        workflow_def=None,
+        workflow_explicit=set(),
         variant=get("variant"),
         preset=get("preset"),
         size=get("size"),
@@ -457,12 +468,26 @@ def _prepare_submission(raw):
             "ok": False, "error": "bad_aspect",
             "message": f"aspect 需要 W:H 字符串，收到 {ns.aspect!r}"})
 
+    if ns.workflow:
+        _imggen_call(mod.apply_workflow, ns, ns.workflow,
+                     mod.workflow_fields_from_mapping(spec))
+        requested_model = ns.model
+    if not isinstance(requested_model, str) or requested_model not in mod.MODELS:
+        available = list(mod.MODELS)
+        raise SubmissionError({
+            "ok": False, "error": "bad_model",
+            "message": f"未知模型 {requested_model!r}",
+            "available": available,
+            "hint": " / ".join(available),
+        })
+
     meta = _resolve_plan(mod, ns, requested_model)
     timeout = _as_timeout(spec.get("timeout"))
 
     return {
         "model": requested_model,
         "cli_model": requested_model,
+        "workflow": getattr(ns, "workflow", None),
         "source": spec.get("source") or "cli",
         "prompt": spec.get("prompt", ""),
         "timeout": timeout,
@@ -474,6 +499,8 @@ def _prepare_submission(raw):
 def _structured_args(spec, model):
     """Translate structured /submit fields into imggen CLI arguments."""
     args = ["--model", model]
+    if spec.get("workflow"):
+        args += ["--workflow", str(spec["workflow"])]
     prompt = spec.get("prompt")
     if prompt:
         args.append(str(prompt))
@@ -621,6 +648,7 @@ class Pool:
             "id": job["id"],
             "seq": job["seq"],
             "model": job["model"],
+            "workflow": job.get("workflow"),
             "source": job["source"],
             "state": job["state"],
             "submitted_at": job["submitted_at"],
@@ -713,6 +741,7 @@ class Pool:
             job = Job(
                 id=jid, seq=self.seq,
                 model=prepared["model"],
+                workflow=prepared.get("workflow"),
                 source=prepared["source"],
                 prompt=prepared["prompt"],
                 args=list(prepared["args"]),
@@ -987,6 +1016,7 @@ class Pool:
                     continue
                 job = Job(id=jid, seq=j.get("seq") or 0,
                           model=j.get("model") or "?",
+                          workflow=j.get("workflow"),
                           source=j.get("source") or "?",
                           prompt=j.get("prompt", ""),
                           args=j.get("args") or [],
@@ -1126,9 +1156,23 @@ class Handler(BaseHTTPRequestHandler):
                              "idle_stop_seconds": IDLE_STOP_SECONDS},
                     "default_model": mod.DEFAULT_MODEL,
                     "models": mod.catalog_models(),
+                    "workflows": mod.catalog_workflows(),
                     "lora_aliases": {
                         k: {"file": v[0], "strength": v[1]}
                         for k, v in mod.LORA_ALIASES.items()},
+                })
+            if u.path == "/workflows":
+                mod = _imggen_module()
+                model = (q.get("model") or [None])[0]
+                if model and model not in mod.MODELS:
+                    return self._send(400, {
+                        "ok": False, "error": "bad_model",
+                        "message": f"未知模型 {model!r}",
+                        "available": list(mod.MODELS)})
+                return self._send(200, {
+                    "ok": True,
+                    "model": model,
+                    "workflows": mod.catalog_workflows(model),
                 })
             if u.path == "/queue":
                 return self._send(200, {"ok": True, "queue": POOL.queue_snapshot()})
@@ -1556,7 +1600,7 @@ def build_imggen_args(a, prompt):
         args.append(prompt)
     if a.source:
         pass  # source 只用于池元数据
-    for name in ("seed", "preset", "variant", "size", "aspect", "width", "height", "steps", "steps2",
+    for name in ("seed", "workflow", "preset", "variant", "size", "aspect", "width", "height", "steps", "steps2",
                  "cfg", "denoise", "denoise2", "scale", "out", "edit", "negative",
                  "lora_strength", "edit_strength", "queue_wait", "lock_wait",
                  "inpaint", "rect", "mask", "refine_level", "refine_denoise",
@@ -1584,6 +1628,23 @@ def build_imggen_args(a, prompt):
 
 def cmd_submit(a):
     import re as _re
+    if a.workflow:
+        mod = _imggen_module()
+        wf = mod.get_workflow(a.workflow)
+        if wf is None:
+            emit({"ok": False, "error": "bad_workflow",
+                  "message": f"未知工作流 {a.workflow!r}",
+                  "hint": "imggen --list 查看可用 workflows"})
+            return 2
+        explicit = mod.workflow_fields_from_argv(sys.argv[1:])
+        if "model" in explicit and a.model != wf["model"]:
+            emit({"ok": False, "error": "bad_workflow_binding",
+                  "message": (f"工作流 {a.workflow} 绑定模型 {wf['model']}，"
+                              f"但请求指定了 {a.model}"),
+                  "workflow": a.workflow, "bound_model": wf["model"]})
+            return 2
+        if "model" not in explicit:
+            a.model = wf["model"]
     if a.model not in ("moss", "anima", "krea2"):
         emit({"ok": False, "error": "bad_model",
               "message": f"未知模型 {a.model!r}", "hint": "moss / anima / krea2"})
@@ -1930,6 +1991,7 @@ def build_parser():
     p = sub.add_parser("submit", help="提交任务（默认等待完成）")
     p.add_argument("prompt", nargs="?")
     p.add_argument("-m", "--model", default="moss")
+    p.add_argument("--workflow", help="声明式工作流 id（model 由 workflow 绑定推出）")
     p.add_argument("--source", default="cli", help="调用方标识，写日志用")
     p.add_argument("--prompt-file")
     p.add_argument("--seed")
